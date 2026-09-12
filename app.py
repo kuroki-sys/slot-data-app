@@ -624,8 +624,17 @@ if menu == "ダッシュボード":
             daily.set_index("date")[["total_diff_medals"]],
             use_container_width=True,
         )
+        daily_display = daily.sort_values("date", ascending=False).rename(
+            columns={
+                "date": "日付",
+                "total_diff_medals": "総差枚",
+                "avg_games": "平均G数",
+                "win_rate": "勝率(%)",
+            }
+        )
+
         st.dataframe(
-            daily.sort_values("date", ascending=False),
+            daily_display,
             use_container_width=True,
             hide_index=True,
         )
@@ -775,7 +784,24 @@ elif menu == "日別集計":
             chart_df.set_index("date")[["total_diff_medals"]],
             use_container_width=True,
         )
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        df_display = df.rename(
+            columns={
+                "date": "日付",
+                "weekday": "曜日",
+                "total_diff_medals": "総差枚",
+                "avg_diff_medals": "平均差枚",
+                "avg_games": "平均G数",
+                "win_rate": "勝率(%)",
+                "win_count": "勝ち台数",
+                "machine_count": "設置台数",
+            }
+        )
+
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+        )
 
 elif menu == "機種別分析":
     st.subheader("機種別分析")
@@ -817,7 +843,25 @@ elif menu == "機種別分析":
     if search:
         df = df[df["machine_name"].astype(str).str.contains(search, case=False, na=False)]
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    df_display = df.rename(
+        columns={
+            "machine_name": "機種名",
+            "records": "データ件数",
+            "days": "データ日数",
+            "machines": "台数",
+            "total_diff_medals": "総差枚",
+            "avg_diff_medals": "平均差枚",
+            "avg_games": "平均G数",
+            "win_count": "勝ち回数",
+            "win_rate": "勝率(%)",
+        }
+    )
+
+    st.dataframe(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+    )
 
 elif menu == "台番号別分析":
     st.subheader("台番号別分析")
@@ -877,4 +921,21 @@ elif menu == "台番号別分析":
     else:
         df = df.sort_values("machine_no")
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    df_display = df.rename(
+        columns={
+            "machine_no": "台番号",
+            "days": "データ日数",
+            "machine_name_example": "機種名",
+            "total_diff_medals": "総差枚",
+            "avg_diff_medals": "平均差枚",
+            "avg_games": "平均G数",
+            "win_count": "勝ち回数",
+            "win_rate": "勝率(%)",
+        }
+    )
+
+    st.dataframe(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+    )
