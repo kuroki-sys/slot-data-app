@@ -88,11 +88,221 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_slot_machine_results_machine_no
         ON slot_machine_results(machine_no);
+
+    CREATE TABLE IF NOT EXISTS slot_special_events (
+        date DATE NOT NULL,
+        store_id BIGINT NOT NULL REFERENCES slot_stores(store_id) ON DELETE CASCADE,
+        event_name TEXT NOT NULL,
+        event_tags TEXT,
+        source_label TEXT,
+        confidence TEXT,
+        note TEXT,
+        PRIMARY KEY (date, store_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_slot_special_events_store_date
+        ON slot_special_events(store_id, date);
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
         conn.commit()
+
+
+
+SPECIAL_EVENT_STORE_NAME = "BIGディッパー新橋1号店"
+
+# ユーザー提供の「仕掛け一覧」画像4枚から、判読に自信がある
+# 特定日・イベント名だけを仮登録する。
+# 読みにくい「機種」「その他仕掛け」は誤登録を避けるため自動転記しない。
+SPECIAL_EVENT_SEEDS = [
+    # 2026年6月
+    ("2026-06-01", "東京大戦 第一章", "東京大戦 第一章"),
+    ("2026-06-03", "スペシャルサンキュー", "スペシャルサンキュー"),
+    ("2026-06-04", "スロパチ", "スロパチ"),
+    ("2026-06-06", "月ゾロ目／裏天下無双", "月ゾロ目,裏天下無双"),
+    ("2026-06-07", "7の付く日", "7の付く日"),
+    ("2026-06-08", "ハーフテン", "ハーフテン"),
+    ("2026-06-09", "スペシャルサンキュー", "スペシャルサンキュー"),
+    ("2026-06-11", "ぶちアゲ無双", "ぶちアゲ無双"),
+    ("2026-06-13", "スペシャルサンキュー", "スペシャルサンキュー"),
+    ("2026-06-14", "九頭龍", "九頭龍"),
+    ("2026-06-15", "一刀両断", "一刀両断"),
+    ("2026-06-17", "7の付く日", "7の付く日"),
+    ("2026-06-18", "ハーフテン", "ハーフテン"),
+    ("2026-06-19", "スペシャルサンキュー", "スペシャルサンキュー"),
+    ("2026-06-22", "ぶちアゲWeek", "ぶちアゲWeek"),
+    ("2026-06-23", "ぶちアゲWeek／スペシャルサンキュー", "ぶちアゲWeek,スペシャルサンキュー"),
+    ("2026-06-24", "ぶちアゲWeek／テッペンDASHリサーチ", "ぶちアゲWeek,テッペンDASHリサーチ"),
+    ("2026-06-25", "ぶちアゲWeek", "ぶちアゲWeek"),
+    ("2026-06-26", "ぶちアゲWeek", "ぶちアゲWeek"),
+    ("2026-06-27", "ぶちアゲWeek／7の付く日", "ぶちアゲWeek,7の付く日"),
+    ("2026-06-28", "ぶちアゲWeek／ハーフテン", "ぶちアゲWeek,ハーフテン"),
+    ("2026-06-29", "スペシャルサンキュー", "スペシャルサンキュー"),
+    ("2026-06-30", "転生", "転生"),
+
+    # 2026年7月
+    ("2026-07-01", "東京大戦 第一章", "東京大戦 第一章"),
+    ("2026-07-03", "THANK YOU", "THANK YOU"),
+    ("2026-07-04", "スロパチ", "スロパチ"),
+    ("2026-07-07", "月ゾロ目／7の付く日", "月ゾロ目,7の付く日"),
+    ("2026-07-08", "ハーフテン／パセリ", "ハーフテン,パセリ"),
+    ("2026-07-09", "THANK YOU", "THANK YOU"),
+    ("2026-07-11", "ぶちアゲ無双", "ぶちアゲ無双"),
+    ("2026-07-17", "7の付く日", "7の付く日"),
+    ("2026-07-18", "ハーフテン／パセリ", "ハーフテン,パセリ"),
+    ("2026-07-19", "THANK YOU", "THANK YOU"),
+    ("2026-07-23", "THANK YOU", "THANK YOU"),
+    ("2026-07-27", "7の付く日", "7の付く日"),
+    ("2026-07-28", "ハーフテン／パセリ", "ハーフテン,パセリ"),
+    ("2026-07-29", "THANK YOU", "THANK YOU"),
+
+    # 2026年8月
+    ("2026-08-01", "東京大戦 第一章", "東京大戦 第一章"),
+    ("2026-08-03", "THANK YOU", "THANK YOU"),
+    ("2026-08-04", "スロパチ", "スロパチ"),
+    ("2026-08-06", "アルマゲドン", "アルマゲドン"),
+    ("2026-08-07", "7の付く日", "7の付く日"),
+    ("2026-08-09", "クロロプレミアム", "クロロプレミアム"),
+    ("2026-08-17", "7の付く日", "7の付く日"),
+    ("2026-08-18", "ハーフテン／パセリ", "ハーフテン,パセリ"),
+    ("2026-08-19", "THANK YOU", "THANK YOU"),
+    ("2026-08-27", "7の付く日", "7の付く日"),
+    ("2026-08-28", "ハーフテン／パセリ", "ハーフテン,パセリ"),
+
+    # 2026年9月
+    ("2026-09-01", "東京大戦 第一章", "東京大戦 第一章"),
+    ("2026-09-02", "1号店・2号店合同取材", "1号店・2号店合同取材"),
+    ("2026-09-03", "THANK YOU", "THANK YOU"),
+    ("2026-09-04", "スロパチ", "スロパチ"),
+    ("2026-09-05", "テッペンDASHリサーチ", "テッペンDASHリサーチ"),
+    ("2026-09-06", "クロロプレミアム", "クロロプレミアム"),
+    ("2026-09-07", "7の付く日", "7の付く日"),
+    ("2026-09-08", "ハーフテン／パセリ", "ハーフテン,パセリ"),
+    ("2026-09-09", "月ゾロ目／裏天下無双", "月ゾロ目,裏天下無双"),
+    ("2026-09-10", "アルマゲドン", "アルマゲドン"),
+    ("2026-09-11", "ぶちアゲ無双", "ぶちアゲ無双"),
+]
+
+
+def split_event_tags(value):
+    if value is None:
+        return []
+    parts = re.split(r"[,、/／|]+", str(value))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def seed_special_event_defaults():
+    """画像から判読できた範囲のイベント名を冪等に仮登録する。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT store_id FROM slot_stores WHERE store_name = %s",
+                (SPECIAL_EVENT_STORE_NAME,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            store_id = row[0]
+
+            for date_str, event_name, event_tags in SPECIAL_EVENT_SEEDS:
+                cur.execute(
+                    """
+                    INSERT INTO slot_special_events
+                    (date, store_id, event_name, event_tags, source_label, confidence, note)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(date, store_id) DO NOTHING
+                    """,
+                    (
+                        date_str,
+                        store_id,
+                        event_name,
+                        event_tags,
+                        "ぽこ独自調べ「仕掛け一覧」画像（ユーザー提供）",
+                        "画像から判読できた範囲",
+                        "イベント名のみ仮登録。画像の機種欄・その他仕掛けは誤読防止のため自動転記していません。",
+                    ),
+                )
+        conn.commit()
+
+
+def upsert_special_event(
+    store_id,
+    event_date,
+    event_name,
+    event_tags,
+    note="",
+    confidence="手入力",
+    source_label="アプリ手入力",
+):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO slot_special_events
+                (date, store_id, event_name, event_tags, source_label, confidence, note)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(date, store_id) DO UPDATE SET
+                    event_name = EXCLUDED.event_name,
+                    event_tags = EXCLUDED.event_tags,
+                    source_label = EXCLUDED.source_label,
+                    confidence = EXCLUDED.confidence,
+                    note = EXCLUDED.note
+                """,
+                (
+                    event_date,
+                    store_id,
+                    event_name.strip(),
+                    event_tags.strip(),
+                    source_label,
+                    confidence,
+                    note.strip(),
+                ),
+            )
+        conn.commit()
+    clear_cache()
+
+
+def delete_special_event(store_id, event_date):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM slot_special_events
+                WHERE store_id = %s AND date = %s
+                """,
+                (store_id, event_date),
+            )
+        conn.commit()
+    clear_cache()
+
+
+def get_special_event_tags(events_df):
+    tags = set()
+    if events_df is None or events_df.empty:
+        return []
+    for value in events_df["event_tags"].fillna(""):
+        tags.update(split_event_tags(value))
+    return sorted(tags, key=kana_sort_key)
+
+
+def matching_special_event_dates(events_df, target_date, selected_tags):
+    if events_df is None or events_df.empty or not selected_tags:
+        return []
+
+    target_ts = pd.Timestamp(target_date)
+    matched = []
+
+    for _, row in events_df.iterrows():
+        row_date = pd.Timestamp(row["date"])
+        if row_date >= target_ts:
+            continue
+
+        row_tags = set(split_event_tags(row.get("event_tags", "")))
+        if all(tag in row_tags for tag in selected_tags):
+            matched.append(row_date)
+
+    return sorted(set(matched))
 
 
 @st.cache_data(ttl=30)
@@ -1594,6 +1804,84 @@ def score_rotation_cached(
     ).reset_index(drop=True)
 
 
+
+def score_special_event_cached(
+    cache,
+    target_date,
+    events_df,
+    selected_tags,
+):
+    """同じ特定日・イベントタグの過去実績から機種候補を採点する。"""
+    if not selected_tags:
+        return pd.DataFrame(), []
+
+    event_dates = matching_special_event_dates(
+        events_df,
+        target_date,
+        selected_tags,
+    )
+
+    if not event_dates:
+        return pd.DataFrame(), []
+
+    _, _, current = strategy_active_info(cache, target_date)
+    if current.empty:
+        return pd.DataFrame(), event_dates
+
+    active_names = set(
+        current["machine_name"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    data = cache["data"]
+    matched = data[
+        data["date"].isin(event_dates)
+        & data["machine_name"].astype(str).isin(active_names)
+    ].copy()
+
+    if matched.empty:
+        return pd.DataFrame(), event_dates
+
+    grouped = (
+        matched.groupby("machine_name")
+        .agg(
+            event_days=("date", "nunique"),
+            samples=("machine_no", "size"),
+            avg_diff=("diff_medals", "mean"),
+            avg_games=("games", "mean"),
+            wins=("diff_medals", lambda s: (s > 0).sum()),
+        )
+        .reset_index()
+    )
+
+    grouped["win_rate"] = (
+        grouped["wins"]
+        / grouped["samples"].replace(0, np.nan)
+        * 100
+    )
+
+    grouped["_diff"] = rank_score(grouped["avg_diff"], True)
+    grouped["_win"] = rank_score(grouped["win_rate"], True)
+    grouped["_days"] = rank_score(grouped["event_days"], True)
+
+    grouped["score"] = (
+        0.50 * grouped["_diff"]
+        + 0.35 * grouped["_win"]
+        + 0.15 * grouped["_days"]
+    ).round(1)
+
+    return (
+        grouped.sort_values(
+            ["score", "avg_diff", "win_rate"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True),
+        event_dates,
+    )
+
+
 def build_combined_ranking(
     cache,
     target_date,
@@ -1603,6 +1891,7 @@ def build_combined_ranking(
     dip_df,
     uphold_df,
     rotation_df,
+    special_event_df=None,
 ):
     """6種類の狙い点を台番号ごとにまとめて総合点を作る。"""
     _, _, current = strategy_active_info(
@@ -1720,6 +2009,24 @@ def build_combined_ranking(
     else:
         base["rotation_score"] = 0.0
 
+    special_active = (
+        special_event_df is not None
+        and not special_event_df.empty
+    )
+
+    if special_active:
+        base = base.merge(
+            special_event_df[
+                ["machine_name", "score"]
+            ].rename(
+                columns={"score": "special_score"}
+            ),
+            on="machine_name",
+            how="left",
+        )
+    else:
+        base["special_score"] = 0.0
+
     score_columns = [
         "all_score",
         "suffix_score",
@@ -1727,6 +2034,7 @@ def build_combined_ranking(
         "dip_score",
         "uphold_score",
         "rotation_score",
+        "special_score",
     ]
 
     for col in score_columns:
@@ -1738,14 +2046,26 @@ def build_combined_ranking(
             .fillna(0.0)
         )
 
-    weights = {
-        "all_score": 0.20,
-        "suffix_score": 0.15,
-        "block_score": 0.15,
-        "dip_score": 0.20,
-        "uphold_score": 0.15,
-        "rotation_score": 0.15,
-    }
+    if special_active:
+        weights = {
+            "all_score": 0.17,
+            "suffix_score": 0.12,
+            "block_score": 0.12,
+            "dip_score": 0.17,
+            "uphold_score": 0.12,
+            "rotation_score": 0.10,
+            "special_score": 0.20,
+        }
+    else:
+        weights = {
+            "all_score": 0.20,
+            "suffix_score": 0.15,
+            "block_score": 0.15,
+            "dip_score": 0.20,
+            "uphold_score": 0.15,
+            "rotation_score": 0.15,
+            "special_score": 0.0,
+        }
 
     base["total_score"] = sum(
         base[col] * weight
@@ -1759,6 +2079,7 @@ def build_combined_ranking(
         "dip_score": "凹み",
         "uphold_score": "上げ/据え",
         "rotation_score": "ローテ",
+        "special_score": "特定日",
     }
 
     def build_reason(row):
@@ -2092,6 +2413,7 @@ def run_strategy_backtest(
 
 
 init_db()
+seed_special_event_defaults()
 
 st.title("🎰 スロ屋データベース")
 
@@ -2104,6 +2426,7 @@ menu = st.sidebar.radio(
         "日別集計",
         "機種別分析",
         "台番号別分析",
+        "特定日・仕掛け実績",
         "狙い分析",
     ],
 )
@@ -2559,11 +2882,217 @@ elif menu == "台番号別分析":
         hide_index=True,
     )
 
+
+elif menu == "特定日・仕掛け実績":
+    st.subheader("📅 特定日・仕掛け実績")
+    st.write(
+        "ユーザー提供の「仕掛け一覧」画像4枚から判読できた"
+        "特定日・イベント名を保存しています。"
+    )
+    st.caption(
+        "画像の細かい機種欄・その他仕掛けは、誤読を避けるため自動登録していません。"
+        "同じイベント日の台別実績は、登録済みアナスロデータから計算します。"
+    )
+
+    store_id, store_name = store_selector()
+    if store_id is None:
+        st.info("店舗データがありません。")
+        st.stop()
+
+    events = query_df(
+        """
+        SELECT
+            e.date,
+            e.event_name,
+            e.event_tags,
+            e.source_label,
+            e.confidence,
+            e.note,
+            d.total_diff_medals,
+            d.avg_games,
+            d.win_rate
+        FROM slot_special_events e
+        LEFT JOIN slot_daily_store_summary d
+          ON d.store_id = e.store_id
+         AND d.date = e.date
+        WHERE e.store_id = %s
+        ORDER BY e.date DESC
+        """,
+        (store_id,),
+    )
+
+    if events.empty:
+        st.info("特定日データはまだありません。")
+    else:
+        display = events.copy()
+        display = display.rename(
+            columns={
+                "date": "日付",
+                "event_name": "イベント名",
+                "event_tags": "分析タグ",
+                "total_diff_medals": "実データ総差枚",
+                "avg_games": "実データ平均G数",
+                "win_rate": "実データ勝率(%)",
+                "confidence": "確度",
+                "source_label": "情報元",
+                "note": "メモ",
+            }
+        )
+        st.dataframe(
+            display[
+                [
+                    "日付",
+                    "イベント名",
+                    "分析タグ",
+                    "実データ総差枚",
+                    "実データ平均G数",
+                    "実データ勝率(%)",
+                    "確度",
+                    "情報元",
+                    "メモ",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### イベント別の店全体実績")
+        stats_source = events.dropna(
+            subset=["total_diff_medals"]
+        ).copy()
+
+        if stats_source.empty:
+            st.info("台別DBと重なる日がまだありません。")
+        else:
+            stats = (
+                stats_source.groupby("event_name")
+                .agg(
+                    開催回数=("date", "nunique"),
+                    平均総差枚=("total_diff_medals", "mean"),
+                    プラス回数=(
+                        "total_diff_medals",
+                        lambda s: (s > 0).sum(),
+                    ),
+                    平均勝率=("win_rate", "mean"),
+                )
+                .reset_index()
+                .rename(columns={"event_name": "イベント名"})
+            )
+            stats["プラス率(%)"] = (
+                stats["プラス回数"]
+                / stats["開催回数"].replace(0, np.nan)
+                * 100
+            ).round(1)
+            stats["平均総差枚"] = stats["平均総差枚"].round(0)
+            stats["平均勝率"] = stats["平均勝率"].round(1)
+
+            st.dataframe(
+                stats[
+                    [
+                        "イベント名",
+                        "開催回数",
+                        "平均総差枚",
+                        "プラス率(%)",
+                        "平均勝率",
+                    ]
+                ].sort_values(
+                    ["開催回数", "平均総差枚"],
+                    ascending=[False, False],
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.markdown("---")
+    st.markdown("#### 特定日を追加・修正")
+
+    if admin_gate():
+        existing_dates = {}
+        if not events.empty:
+            for _, row in events.iterrows():
+                existing_dates[
+                    pd.Timestamp(row["date"]).date()
+                ] = row
+
+        event_date = st.date_input(
+            "日付",
+            value=datetime.now().date(),
+            key="special_event_date",
+        )
+
+        current_row = existing_dates.get(event_date)
+
+        event_name = st.text_input(
+            "イベント名",
+            value=(
+                str(current_row["event_name"])
+                if current_row is not None
+                else ""
+            ),
+            key=f"special_event_name_{event_date}",
+        )
+
+        event_tags = st.text_input(
+            "分析タグ（複数はカンマ区切り）",
+            value=(
+                str(current_row["event_tags"] or "")
+                if current_row is not None
+                else ""
+            ),
+            placeholder="例：7の付く日,ぶちアゲWeek",
+            key=f"special_event_tags_{event_date}",
+        )
+
+        note = st.text_area(
+            "メモ",
+            value=(
+                str(current_row["note"] or "")
+                if current_row is not None
+                else ""
+            ),
+            key=f"special_event_note_{event_date}",
+        )
+
+        c1, c2 = st.columns(2)
+
+        if c1.button(
+            "この内容で保存",
+            type="primary",
+            key="save_special_event",
+        ):
+            if not event_name.strip():
+                st.error("イベント名を入力してください。")
+            else:
+                upsert_special_event(
+                    store_id,
+                    event_date,
+                    event_name,
+                    event_tags or event_name,
+                    note=note,
+                )
+                st.success("特定日・イベント情報を保存しました。")
+                st.rerun()
+
+        if (
+            current_row is not None
+            and c2.button(
+                "この日を削除",
+                key="delete_special_event",
+            )
+        ):
+            delete_special_event(
+                store_id,
+                event_date,
+            )
+            st.success("削除しました。")
+            st.rerun()
+
+
 elif menu == "狙い分析":
     st.subheader("🎯 狙い分析")
     st.write(
         "過去データから、全台系・末尾・並び・凹み・上げ/据え・"
-        "機種ローテの6方向で候補を点数化します。"
+        "機種ローテに加えて、特定日・イベント傾向も候補点へ反映します。"
     )
     st.caption(
         "点数は設定を断定する数字ではなく、過去傾向の相対評価です。"
@@ -2618,6 +3147,52 @@ elif menu == "狙い分析":
         value=default_target,
         min_value=min_data_date.date(),
         key="strategy_target_date",
+    )
+
+
+    special_events = query_df(
+        """
+        SELECT
+            date,
+            event_name,
+            event_tags,
+            source_label,
+            confidence,
+            note
+        FROM slot_special_events
+        WHERE store_id = %s
+        ORDER BY date
+        """,
+        (store_id,),
+    )
+
+    available_event_tags = get_special_event_tags(
+        special_events
+    )
+
+    default_event_tags = []
+    if not special_events.empty:
+        exact_target = special_events[
+            pd.to_datetime(special_events["date"]).dt.date
+            == target_date
+        ]
+        if not exact_target.empty:
+            default_event_tags = split_event_tags(
+                exact_target.iloc[0]["event_tags"]
+            )
+
+    selected_event_tags = st.multiselect(
+        "今回の特定日・イベント（複数選択可）",
+        options=available_event_tags,
+        default=[
+            tag
+            for tag in default_event_tags
+            if tag in available_event_tags
+        ],
+        help=(
+            "例：7の付く日＋ぶちアゲWeek。"
+            "複数選んだ場合は、過去にそのタグがすべて重なった日だけで分析します。"
+        ),
     )
 
     history_before_target = analysis_data[
@@ -2752,6 +3327,15 @@ elif menu == "狙い分析":
             )
         )
 
+        special_event_candidates, matched_event_dates = (
+            score_special_event_cached(
+                strategy_cache,
+                target_date,
+                special_events,
+                selected_event_tags,
+            )
+        )
+
         combined_ranking = build_combined_ranking(
             strategy_cache,
             target_date,
@@ -2761,6 +3345,7 @@ elif menu == "狙い分析":
             dip_candidates,
             uphold_candidates,
             rotation_candidates,
+            special_event_candidates,
         )
 
     tabs = st.tabs(
@@ -2772,16 +3357,24 @@ elif menu == "狙い分析":
             "凹み",
             "上げ/据え",
             "機種ローテ",
+            "特定日",
             "バックテスト",
         ]
     )
 
     with tabs[0]:
         st.markdown("#### 総合狙いランキング")
-        st.caption(
-            "全台20%・末尾15%・並び15%・凹み20%・"
-            "上げ/据え15%・機種ローテ15%で総合点を計算しています。"
-        )
+        if selected_event_tags and not special_event_candidates.empty:
+            st.caption(
+                "今回は特定日傾向を20%反映。"
+                "全台17%・末尾12%・並び12%・凹み17%・"
+                "上げ/据え12%・機種ローテ10%・特定日20%です。"
+            )
+        else:
+            st.caption(
+                "特定日指定なしの場合は、全台20%・末尾15%・並び15%・"
+                "凹み20%・上げ/据え15%・機種ローテ15%です。"
+            )
 
         if combined_ranking.empty:
             st.info("候補を計算できませんでした。")
@@ -2818,6 +3411,7 @@ elif menu == "狙い分析":
                     "dip_score": "凹み点",
                     "uphold_score": "上げ/据え点",
                     "rotation_score": "ローテ点",
+                    "special_score": "特定日点",
                     "uphold_type": "上げ/据え種別",
                     "reason": "主な根拠",
                 }
@@ -2835,6 +3429,7 @@ elif menu == "狙い分析":
                     "凹み点",
                     "上げ/据え点",
                     "ローテ点",
+                    "特定日点",
                     "上げ/据え種別",
                     "主な根拠",
                 ]
@@ -3156,11 +3751,86 @@ elif menu == "狙い分析":
                 hide_index=True,
             )
 
+
     with tabs[7]:
+        st.markdown("#### 特定日・イベント機種候補")
+
+        if not selected_event_tags:
+            st.info(
+                "上の「今回の特定日・イベント」からイベントを選ぶと、"
+                "同じ特定日の過去実績を機種ごとに集計します。"
+            )
+        elif not matched_event_dates:
+            st.info(
+                "この組み合わせに一致する過去開催日がありません。"
+            )
+        else:
+            st.write(
+                "選択中："
+                + " ＋ ".join(selected_event_tags)
+            )
+            st.caption(
+                "過去の一致日："
+                + "、".join(
+                    pd.Timestamp(d).strftime("%Y/%m/%d")
+                    for d in matched_event_dates
+                )
+            )
+
+            if special_event_candidates.empty:
+                st.info(
+                    "一致する開催日はありますが、現在の台別DBと重なる実績がありません。"
+                )
+            else:
+                display = special_event_candidates.copy()
+                display.insert(
+                    0,
+                    "順位",
+                    range(1, len(display) + 1),
+                )
+                display = display.rename(
+                    columns={
+                        "machine_name": "機種名",
+                        "event_days": "一致開催日数",
+                        "samples": "台別サンプル数",
+                        "avg_diff": "一致日平均差枚",
+                        "avg_games": "一致日平均G数",
+                        "win_rate": "一致日勝率(%)",
+                        "score": "特定日点",
+                    }
+                )
+
+                st.dataframe(
+                    display[
+                        [
+                            "順位",
+                            "機種名",
+                            "特定日点",
+                            "一致開催日数",
+                            "一致日平均差枚",
+                            "一致日勝率(%)",
+                            "一致日平均G数",
+                            "台別サンプル数",
+                        ]
+                    ].head(40),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.caption(
+                    "この特定日点は画像の機種名を推測したものではありません。"
+                    "登録済みアナスロ台別実績から、同じイベント日に実際に強かった機種を集計しています。"
+                )
+
+    with tabs[8]:
         st.markdown("#### 過去データでバックテスト")
         st.write(
-            "各日について、その日より前のデータだけで候補を作り、"
-            "実際の当日結果と照合します。"
+            "全台系・末尾・並び・凹み・上げ/据え・機種ローテの6種類について、"
+            "各日より前のデータだけで候補を作り、実際の当日結果と照合します。"
+        )
+        st.caption(
+            "特定日分析はイベント名が付いている日のみ母数が増えるため、"
+            "現在は上の「特定日」タブで開催日数と実績を別表示しています。"
         )
 
         available_test_days = max(
