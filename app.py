@@ -927,15 +927,47 @@ elif menu == "台番号別分析":
             SUM(diff_medals) AS total_diff_medals,
             ROUND(AVG(diff_medals), 1) AS avg_diff_medals,
             ROUND(AVG(games), 1) AS avg_games,
+
+            SUM(COALESCE(bb, 0)) AS bb_total,
+            SUM(COALESCE(rb, 0)) AS rb_total,
+
+            ROUND(
+                SUM(COALESCE(games, 0))::numeric
+                / NULLIF(
+                    SUM(COALESCE(bb, 0)) + SUM(COALESCE(rb, 0)),
+                    0
+                ),
+                1
+            ) AS combined_rate_period,
+
+            ROUND(
+                SUM(COALESCE(games, 0))::numeric
+                / NULLIF(SUM(COALESCE(bb, 0)), 0),
+                1
+            ) AS bb_rate_period,
+
+            ROUND(
+                SUM(COALESCE(games, 0))::numeric
+                / NULLIF(SUM(COALESCE(rb, 0)), 0),
+                1
+            ) AS rb_rate_period,
+
             SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END) AS win_count,
+
             ROUND(
                 100.0 * SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
                 / NULLIF(COUNT(*), 0),
                 1
             ) AS win_rate
+
         FROM slot_machine_results
-        WHERE store_id = %s AND date BETWEEN %s AND %s
+
+        WHERE
+            store_id = %s
+            AND date BETWEEN %s AND %s
+
         GROUP BY machine_no
+
         ORDER BY total_diff_medals DESC
         """,
         (store_id, start_date, end_date),
@@ -964,7 +996,19 @@ elif menu == "台番号別分析":
     else:
         df = df.sort_values("machine_no")
 
-    df_display = df.rename(
+    df_display = df.copy()
+
+    df_display["combined_rate_period"] = df_display["combined_rate_period"].apply(
+        lambda x: f"1/{float(x):.1f}" if pd.notna(x) else "-"
+    )
+    df_display["bb_rate_period"] = df_display["bb_rate_period"].apply(
+        lambda x: f"1/{float(x):.1f}" if pd.notna(x) else "-"
+    )
+    df_display["rb_rate_period"] = df_display["rb_rate_period"].apply(
+        lambda x: f"1/{float(x):.1f}" if pd.notna(x) else "-"
+    )
+
+    df_display = df_display.rename(
         columns={
             "machine_no": "台番号",
             "days": "データ日数",
@@ -972,6 +1016,11 @@ elif menu == "台番号別分析":
             "total_diff_medals": "総差枚",
             "avg_diff_medals": "平均差枚",
             "avg_games": "平均G数",
+            "bb_total": "BB",
+            "rb_total": "RB",
+            "combined_rate_period": "合算",
+            "bb_rate_period": "BB確率",
+            "rb_rate_period": "RB確率",
             "win_count": "勝ち回数",
             "win_rate": "勝率(%)",
         }
