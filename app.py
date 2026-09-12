@@ -10,6 +10,7 @@ import pandas as pd
 import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
+from pykakasi import kakasi
 
 
 st.set_page_config(
@@ -139,6 +140,20 @@ def rate_num(value):
         except Exception:
             return None
     return None
+
+
+_kakasi = kakasi()
+
+
+def kana_sort_key(value):
+    """機種名を読み仮名ベースで並べるためのキーを返す。"""
+    text = str(value or "")
+    converted = _kakasi.convert(text)
+    reading = "".join(
+        item.get("hira") or item.get("kana") or item.get("orig") or ""
+        for item in converted
+    )
+    return reading.casefold()
 
 
 def parse_page_title(raw):
@@ -839,11 +854,39 @@ elif menu == "機種別分析":
         (store_id, start_date, end_date),
     )
 
-    search = st.text_input("機種名検索")
-    if search:
-        df = df[df["machine_name"].astype(str).str.contains(search, case=False, na=False)]
+    st.markdown("#### 機種検索")
 
-    df_display = df.rename(
+    search = st.text_input(
+        "① 機種名を入力して検索",
+        placeholder="例：ジャグラー、北斗、モンキー など",
+    )
+
+    machine_choices = sorted(
+        df["machine_name"].dropna().astype(str).unique().tolist(),
+        key=kana_sort_key,
+    )
+
+    selected_machines = st.multiselect(
+        "② 機種を複数選択（カナ順）",
+        options=machine_choices,
+        placeholder="機種を選択してください（複数選択可）",
+    )
+
+    filtered_df = df.copy()
+
+    if search:
+        filtered_df = filtered_df[
+            filtered_df["machine_name"]
+            .astype(str)
+            .str.contains(search, case=False, na=False)
+        ]
+
+    if selected_machines:
+        filtered_df = filtered_df[
+            filtered_df["machine_name"].isin(selected_machines)
+        ]
+
+    df_display = filtered_df.rename(
         columns={
             "machine_name": "機種名",
             "records": "データ件数",
