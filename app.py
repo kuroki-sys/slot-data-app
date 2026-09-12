@@ -1,4 +1,5 @@
 import streamlit as st
+import psycopg
 
 st.set_page_config(
     page_title="スロ屋データベース",
@@ -8,19 +9,18 @@ st.set_page_config(
 
 st.title("🎰 スロ屋データベース")
 
-st.success("アプリの初期設定が完了しました。")
+st.subheader("データベース接続確認")
 
-st.write("BIGディッパー新橋1号店などのスロット実績データを蓄積・分析するアプリです。")
+try:
+    database_url = st.secrets["DATABASE_URL"]
 
-st.subheader("これから追加する機能")
-st.write("""
-- アナスロJSONのインポート
-- 日付・店舗別のデータベース保存
-- 台番号別分析
-- 機種別分析
-- 日別総差枚
-- 曜日別傾向
-- 過去の凹み台・上げ狙い分析
-- 特定日分析
-- 狙い台候補の抽出
-""")
+    with psycopg.connect(database_url, connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+
+    st.success("✅ Neonデータベース接続成功")
+
+except Exception as e:
+    st.error("❌ Neonデータベースに接続できません")
+    st.code(str(e))
