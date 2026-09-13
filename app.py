@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -135,6 +136,34 @@ def init_db():
         ON slot_store_events(store_id, date);
     CREATE INDEX IF NOT EXISTS idx_slot_store_events_name
         ON slot_store_events(store_id, event_name);
+
+    -- ジャグラー公式スペックの共通マスタ。店舗には依存せず全店舗で共有する。
+    CREATE TABLE IF NOT EXISTS slot_juggler_masters (
+        spec_id BIGSERIAL PRIMARY KEY,
+        machine_name TEXT NOT NULL UNIQUE,
+        source_label TEXT,
+        source_url TEXT,
+        note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS slot_juggler_spec_values (
+        spec_id BIGINT NOT NULL REFERENCES slot_juggler_masters(spec_id) ON DELETE CASCADE,
+        setting SMALLINT NOT NULL CHECK (setting BETWEEN 1 AND 6),
+        bb_den NUMERIC NOT NULL,
+        rb_den NUMERIC NOT NULL,
+        combined_den NUMERIC NOT NULL,
+        PRIMARY KEY (spec_id, setting)
+    );
+
+    CREATE TABLE IF NOT EXISTS slot_juggler_aliases (
+        alias_name TEXT PRIMARY KEY,
+        spec_id BIGINT NOT NULL REFERENCES slot_juggler_masters(spec_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_slot_juggler_alias_spec
+        ON slot_juggler_aliases(spec_id);
 
     CREATE TABLE IF NOT EXISTS slot_schema_migrations (
         migration_key TEXT PRIMARY KEY,
@@ -1021,6 +1050,268 @@ def date_range_selector(store_id, key_prefix):
     if isinstance(selected, (tuple, list)) and len(selected) == 2:
         return selected[0], selected[1]
     return min_date, max_date
+
+
+
+def is_juggler_name(value):
+    text = str(value or "").strip()
+    return ("ジャグラー" in text) or ("JUGGLER" in text.upper())
+
+
+@st.cache_data(ttl=30)
+def load_juggler_spec_map():
+    """機種名・別名から設定1～6の公式スペックへ引ける辞書を作る。"""
+    rows = query_df(
+        """
+        SELECT
+            m.spec_id,
+            m.machine_name,
+            m.source_label,
+            m.source_url,
+            m.note,
+            v.setting,
+            v.bb_den,
+            v.rb_den,
+            v.combined_den
+        FROM slot_juggler_masters m
+        JOIN slot_juggler_spec_values v
+          ON v.spec_id = m.spec_id
+        ORDER BY m.machine_name, v.setting
+        """
+    )
+    aliases = query_df(
+        """
+        SELECT a.alias_name, a.spec_id, m.machine_name
+        FROM slot_juggler_aliases a
+        JOIN slot_juggler_masters m ON m.spec_id = a.spec_id
+        ORDER BY a.alias_name
+        """
+    )
+
+    by_spec = {}
+    if not rows.empty:
+        for spec_id, group in rows.groupby("spec_id"):
+            first = group.iloc[0]
+            settings = {}
+            for _, r in group.iterrows():
+                settings[int(r["setting"])] = {
+                    "bb_den": float(r["bb_den"]),
+                    "rb_den": float(r["rb_den"]),
+                    "combined_den": float(r["combined_den"]),
+                }
+            by_spec[int(spec_id)] = {
+                "spec_id": int(spec_id),
+                "machine_name": str(first["machine_name"]),
+                "source_label": first.get("source_label"),
+                "source_url": first.get("source_url"),
+                "note": first.get("note"),
+                "settings": settings,
+            }
+
+    name_map = {}
+    for spec in by_spec.values():
+        name_map[spec["machine_name"]] = spec
+
+    if not aliases.empty:
+        for _, r in aliases.iterrows():
+            spec = by_spec.get(int(r["spec_id"]))
+            if spec:
+                name_map[str(r["alias_name"])] = spec
+
+    return name_map, by_spec
+
+
+def get_detected_juggler_names():
+    df = query_df(
+        """
+        SELECT DISTINCT machine_name
+        FROM slot_machine_results
+        WHERE machine_name IS NOT NULL
+          AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+        ORDER BY machine_name
+        """
+    )
+    if df.empty:
+        return []
+    names = [str(x) for x in df["machine_name"].dropna().tolist()]
+    return sorted(set(names), key=kana_sort_key)
+
+
+def calc_combined_den(bb_den, rb_den):
+    try:
+        bb = float(bb_den)
+        rb = float(rb_den)
+        if bb <= 0 or rb <= 0:
+            return None
+        return 1.0 / ((1.0 / bb) + (1.0 / rb))
+    except Exception:
+        return None
+
+
+def poisson_logpmf(k, lam):
+    if lam <= 0:
+        return -1.0e18
+    k = int(max(0, k))
+    return k * math.log(lam) - lam - math.lgamma(k + 1)
+
+
+def juggler_setting_fit(games, bb, rb, spec):
+    """
+    BB/RB回数を設定1～6の公式確率と比較する。
+    独立Poisson近似の相対尤度を0～100%へ正規化する。
+    これは実設定の確率や設定確定を意味しない。
+    """
+    try:
+        games = int(games or 0)
+        bb = int(bb or 0)
+        rb = int(rb or 0)
+    except Exception:
+        return None
+
+    if games <= 0 or not spec or len(spec.get("settings", {})) < 6:
+        return None
+
+    logs = {}
+    for setting in range(1, 7):
+        vals = spec["settings"].get(setting)
+        if not vals:
+            return None
+        bb_den = float(vals["bb_den"])
+        rb_den = float(vals["rb_den"])
+        if bb_den <= 0 or rb_den <= 0:
+            return None
+        lam_bb = games / bb_den
+        lam_rb = games / rb_den
+        logs[setting] = poisson_logpmf(bb, lam_bb) + poisson_logpmf(rb, lam_rb)
+
+    max_log = max(logs.values())
+    weights = {s: math.exp(v - max_log) for s, v in logs.items()}
+    denom = sum(weights.values()) or 1.0
+    fits = {s: (weights[s] / denom) * 100.0 for s in range(1, 7)}
+    best_setting = max(fits, key=fits.get)
+    high_fit = fits[5] + fits[6]
+    best_fit = fits[best_setting]
+
+    if games >= 6000:
+        data_confidence = "高"
+        game_factor = 1.0
+    elif games >= 3000:
+        data_confidence = "中"
+        game_factor = 0.75
+    elif games >= 1000:
+        data_confidence = "低"
+        game_factor = 0.45
+    else:
+        data_confidence = "かなり低い"
+        game_factor = 0.20
+
+    if games < 1000 or best_fit < 30:
+        judgement = "判別困難"
+    else:
+        judgement = f"設定{best_setting}寄り"
+
+    total_bonus = bb + rb
+    actual_combined = (games / total_bonus) if total_bonus > 0 else None
+    aim_score = min(100.0, high_fit * game_factor)
+
+    return {
+        "best_setting": best_setting,
+        "best_fit": best_fit,
+        "high_fit": high_fit,
+        "setting6_fit": fits[6],
+        "data_confidence": data_confidence,
+        "judgement": judgement,
+        "actual_combined": actual_combined,
+        "aim_score": aim_score,
+        "fits": fits,
+    }
+
+
+def save_juggler_master(machine_name, source_label, source_url, note, aliases, spec_rows):
+    machine_name = str(machine_name or "").strip()
+    if not machine_name:
+        raise ValueError("機種名を入力してください。")
+
+    normalized = []
+    for row in spec_rows:
+        setting = int(row["setting"])
+        bb_den = float(row["bb_den"])
+        rb_den = float(row["rb_den"])
+        combined_den = row.get("combined_den")
+        if bb_den <= 0 or rb_den <= 0:
+            raise ValueError(f"設定{setting}のBB/RB確率を確認してください。")
+        if combined_den in (None, "") or pd.isna(combined_den):
+            combined_den = calc_combined_den(bb_den, rb_den)
+        combined_den = float(combined_den)
+        if combined_den <= 0:
+            raise ValueError(f"設定{setting}の合算確率を確認してください。")
+        normalized.append((setting, bb_den, rb_den, combined_den))
+
+    settings = {x[0] for x in normalized}
+    if settings != set(range(1, 7)):
+        raise ValueError("設定1～6をすべて入力してください。")
+
+    aliases = [str(x).strip() for x in aliases if str(x).strip()]
+    aliases = sorted(set(x for x in aliases if x != machine_name))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO slot_juggler_masters
+                    (machine_name, source_label, source_url, note, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT(machine_name) DO UPDATE SET
+                    source_label = EXCLUDED.source_label,
+                    source_url = EXCLUDED.source_url,
+                    note = EXCLUDED.note,
+                    updated_at = NOW()
+                RETURNING spec_id
+                """,
+                (machine_name, source_label, source_url, note),
+            )
+            spec_id = int(cur.fetchone()[0])
+
+            cur.execute("DELETE FROM slot_juggler_spec_values WHERE spec_id = %s", (spec_id,))
+            for setting, bb_den, rb_den, combined_den in normalized:
+                cur.execute(
+                    """
+                    INSERT INTO slot_juggler_spec_values
+                        (spec_id, setting, bb_den, rb_den, combined_den)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (spec_id, setting, bb_den, rb_den, combined_den),
+                )
+
+            cur.execute("DELETE FROM slot_juggler_aliases WHERE spec_id = %s", (spec_id,))
+            for alias in aliases:
+                cur.execute(
+                    """
+                    INSERT INTO slot_juggler_aliases(alias_name, spec_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT(alias_name) DO UPDATE SET spec_id = EXCLUDED.spec_id
+                    """,
+                    (alias, spec_id),
+                )
+        conn.commit()
+    clear_cache()
+    return spec_id
+
+
+def juggler_master_status_df():
+    detected = get_detected_juggler_names()
+    name_map, _ = load_juggler_spec_map()
+    rows = []
+    for name in detected:
+        spec = name_map.get(name)
+        rows.append(
+            {
+                "機種名": name,
+                "登録状況": "登録済み" if spec else "未登録",
+                "参照マスタ": spec["machine_name"] if spec else "-",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def rank_score(series, higher_is_better=True):
@@ -2673,6 +2964,8 @@ menu = st.sidebar.radio(
         "日別集計",
         "機種別分析",
         "台番号別分析",
+        "ジャグラー設定判別",
+        "ジャグラー公式スペック管理",
         "店舗別イベント管理",
         "狙い分析",
     ],
@@ -3218,6 +3511,356 @@ elif menu == "台番号別分析":
         use_container_width=True,
         hide_index=True,
     )
+
+
+elif menu == "ジャグラー設定判別":
+    st.subheader("🤡 ジャグラー設定判別")
+    st.write(
+        "公式スペックマスタの設定1～6と、実際のG数・BB・RBを比較して、"
+        "各設定への相対的な適合度を表示します。"
+    )
+    st.caption(
+        "実設定を確定する機能ではありません。特にG数が少ない台は判別のブレが大きいため、"
+        "『データ信頼度』と一緒に見てください。"
+    )
+
+    store_id, store_name = store_selector()
+    if store_id is None:
+        st.info("店舗データがありません。")
+        st.stop()
+
+    juggler_dates = query_df(
+        """
+        SELECT DISTINCT date
+        FROM slot_machine_results
+        WHERE store_id = %s
+          AND machine_name IS NOT NULL
+          AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+        ORDER BY date
+        """,
+        (store_id,),
+    )
+    if juggler_dates.empty:
+        st.info("この店舗にはジャグラー系のデータがまだありません。")
+        st.stop()
+
+    mode = st.radio(
+        "判別方法",
+        ["1日ごとに判別", "期間合計で判別"],
+        horizontal=True,
+        key="juggler_judge_mode",
+    )
+
+    available_dates = [x for x in juggler_dates["date"].tolist()]
+
+    if mode == "1日ごとに判別":
+        target_date = st.selectbox(
+            "判別日",
+            options=list(reversed(available_dates)),
+            format_func=lambda x: str(x),
+            key="juggler_single_date",
+        )
+        raw = query_df(
+            """
+            SELECT date, machine_no, machine_name, games, bb, rb,
+                   combined_rate, combined_rate_text
+            FROM slot_machine_results
+            WHERE store_id = %s
+              AND date = %s
+              AND machine_name IS NOT NULL
+              AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+            ORDER BY machine_no
+            """,
+            (store_id, target_date),
+        )
+    else:
+        min_date = min(available_dates)
+        max_date = max(available_dates)
+        selected_range = st.date_input(
+            "集計期間",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key="juggler_period_dates",
+        )
+        if isinstance(selected_range, (tuple, list)) and len(selected_range) == 2:
+            start_date, end_date = selected_range
+        else:
+            start_date, end_date = min_date, max_date
+
+        raw = query_df(
+            """
+            SELECT
+                machine_no,
+                machine_name,
+                SUM(COALESCE(games, 0)) AS games,
+                SUM(COALESCE(bb, 0)) AS bb,
+                SUM(COALESCE(rb, 0)) AS rb,
+                COUNT(*) AS data_days
+            FROM slot_machine_results
+            WHERE store_id = %s
+              AND date BETWEEN %s AND %s
+              AND machine_name IS NOT NULL
+              AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+            GROUP BY machine_no, machine_name
+            ORDER BY machine_no
+            """,
+            (store_id, start_date, end_date),
+        )
+
+    if raw.empty:
+        st.info("対象期間にジャグラーデータがありません。")
+        st.stop()
+
+    machine_options = sorted(raw["machine_name"].dropna().astype(str).unique().tolist(), key=kana_sort_key)
+    selected_machines = st.multiselect(
+        "機種を絞り込み（複数選択可・カナ順）",
+        options=machine_options,
+        placeholder="未選択なら全ジャグラーを表示",
+    )
+    if selected_machines:
+        raw = raw[raw["machine_name"].isin(selected_machines)].copy()
+
+    name_map, _ = load_juggler_spec_map()
+    display_rows = []
+    missing_specs = set()
+
+    for _, r in raw.iterrows():
+        name = str(r.get("machine_name") or "")
+        spec = name_map.get(name)
+        if not spec:
+            missing_specs.add(name)
+            display_rows.append(
+                {
+                    "台番号": int(r["machine_no"]),
+                    "機種名": name,
+                    "G数": int(r.get("games") or 0),
+                    "BB": int(r.get("bb") or 0),
+                    "RB": int(r.get("rb") or 0),
+                    "実績合算": "-",
+                    "最適合": "公式スペック未登録",
+                    "設定5以上適合度(%)": None,
+                    "設定6適合度(%)": None,
+                    "狙い参考点": None,
+                    "データ信頼度": "-",
+                    **{f"設定{s}適合度(%)": None for s in range(1, 7)},
+                }
+            )
+            continue
+
+        fit = juggler_setting_fit(r.get("games"), r.get("bb"), r.get("rb"), spec)
+        if not fit:
+            continue
+
+        actual_combined = fit["actual_combined"]
+        row = {
+            "台番号": int(r["machine_no"]),
+            "機種名": name,
+            "G数": int(r.get("games") or 0),
+            "BB": int(r.get("bb") or 0),
+            "RB": int(r.get("rb") or 0),
+            "実績合算": f"1/{actual_combined:.1f}" if actual_combined else "-",
+            "最適合": fit["judgement"],
+            "設定5以上適合度(%)": round(fit["high_fit"], 1),
+            "設定6適合度(%)": round(fit["setting6_fit"], 1),
+            "狙い参考点": round(fit["aim_score"], 1),
+            "データ信頼度": fit["data_confidence"],
+        }
+        for s in range(1, 7):
+            row[f"設定{s}適合度(%)"] = round(fit["fits"][s], 1)
+        if "data_days" in r.index:
+            row["データ日数"] = int(r.get("data_days") or 0)
+        display_rows.append(row)
+
+    result = pd.DataFrame(display_rows)
+    if result.empty:
+        st.info("判別できるデータがありません。")
+        st.stop()
+
+    if missing_specs:
+        st.warning(
+            "公式スペック未登録の機種があります："
+            + "、".join(sorted(missing_specs, key=kana_sort_key))
+        )
+        st.caption("左メニューの『ジャグラー公式スペック管理』から設定1～6を登録すると判別できます。")
+
+    c1, c2, c3 = st.columns(3)
+    registered_mask = result["設定5以上適合度(%)"].notna()
+    c1.metric("対象台数", f"{len(result):,}台")
+    c2.metric("判別可能", f"{int(registered_mask.sum()):,}台")
+    if registered_mask.any():
+        top_score = result.loc[registered_mask, "狙い参考点"].max()
+        c3.metric("最高 狙い参考点", f"{float(top_score):.1f}点")
+    else:
+        c3.metric("最高 狙い参考点", "-")
+
+    sort_choice = st.selectbox(
+        "並び順",
+        ["狙い参考点が高い順", "設定5以上適合度が高い順", "G数が多い順", "台番号順"],
+    )
+    if sort_choice == "狙い参考点が高い順":
+        result = result.sort_values(["狙い参考点", "G数"], ascending=[False, False], na_position="last")
+    elif sort_choice == "設定5以上適合度が高い順":
+        result = result.sort_values(["設定5以上適合度(%)", "G数"], ascending=[False, False], na_position="last")
+    elif sort_choice == "G数が多い順":
+        result = result.sort_values("G数", ascending=False)
+    else:
+        result = result.sort_values("台番号")
+
+    base_cols = ["台番号", "機種名", "G数", "BB", "RB", "実績合算", "最適合",
+                 "設定5以上適合度(%)", "設定6適合度(%)", "狙い参考点", "データ信頼度"]
+    if "データ日数" in result.columns:
+        base_cols.insert(2, "データ日数")
+    st.dataframe(result[base_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("設定1～6の適合度を全部見る"):
+        detail_cols = ["台番号", "機種名", "G数"] + [f"設定{s}適合度(%)" for s in range(1, 7)]
+        st.dataframe(result[detail_cols], use_container_width=True, hide_index=True)
+
+    st.caption(
+        "狙い参考点は『設定5以上への相対適合度 × G数による信頼度補正』です。"
+        "実際の設定や翌日の投入を保証する数字ではありません。"
+    )
+
+
+elif menu == "ジャグラー公式スペック管理":
+    st.subheader("📘 ジャグラー公式スペック管理")
+    st.write(
+        "ジャグラーの設定1～6について、公式BB確率・RB確率・合算を登録します。"
+        "一度登録すれば全店舗で共通利用できます。新台もここへ追加するだけで対応できます。"
+    )
+
+    if not admin_gate():
+        st.stop()
+
+    status_df = juggler_master_status_df()
+    if not status_df.empty:
+        st.markdown("#### DBで検出したジャグラー")
+        st.dataframe(status_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("まだDB内にジャグラー系機種がありません。手入力で先にマスタ登録することもできます。")
+
+    detected = get_detected_juggler_names()
+    options = ["（新しい機種名を手入力）"] + detected
+    selected = st.selectbox(
+        "登録・更新する機種",
+        options=options,
+        key="juggler_master_target",
+    )
+
+    name_map, by_spec = load_juggler_spec_map()
+    existing_spec = None if selected == "（新しい機種名を手入力）" else name_map.get(selected)
+
+    default_name = existing_spec["machine_name"] if existing_spec else ("" if selected.startswith("（") else selected)
+    machine_name = st.text_input("正式な機種名", value=default_name)
+
+    existing_aliases = []
+    if existing_spec:
+        alias_df = query_df(
+            "SELECT alias_name FROM slot_juggler_aliases WHERE spec_id = %s ORDER BY alias_name",
+            (existing_spec["spec_id"],),
+        )
+        if not alias_df.empty:
+            existing_aliases = alias_df["alias_name"].astype(str).tolist()
+
+    alias_text = st.text_area(
+        "別名・表記揺れ（任意）",
+        value="\n".join(existing_aliases),
+        help="1行に1つ。別店舗で機種名表記が違う場合に同じ公式マスタへ紐づけます。",
+    )
+    source_label = st.text_input(
+        "情報元名",
+        value=(str(existing_spec.get("source_label") or "") if existing_spec else ""),
+        placeholder="例：北電子公式",
+    )
+    source_url = st.text_input(
+        "公式URL（任意）",
+        value=(str(existing_spec.get("source_url") or "") if existing_spec else ""),
+    )
+    note = st.text_area(
+        "メモ（任意）",
+        value=(str(existing_spec.get("note") or "") if existing_spec else ""),
+    )
+
+    existing_values = {}
+    if existing_spec:
+        existing_values = existing_spec.get("settings", {})
+
+    editor_rows = []
+    for s in range(1, 7):
+        vals = existing_values.get(s, {})
+        editor_rows.append(
+            {
+                "設定": s,
+                "BB確率分母": vals.get("bb_den"),
+                "RB確率分母": vals.get("rb_den"),
+                "合算分母": vals.get("combined_den"),
+            }
+        )
+    editor_df = pd.DataFrame(editor_rows)
+
+    st.markdown("#### 設定1～6 公式スペック")
+    st.caption("例：BB 1/273.1 の場合は『273.1』と入力します。合算が空欄ならBB・RBから自動計算します。")
+    edited = st.data_editor(
+        editor_df,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["設定"],
+        num_rows="fixed",
+        key=f"juggler_spec_editor_{existing_spec['spec_id'] if existing_spec else 'new'}_{selected}",
+        column_config={
+            "設定": st.column_config.NumberColumn("設定", step=1),
+            "BB確率分母": st.column_config.NumberColumn("BB確率分母", min_value=1.0, format="%.2f"),
+            "RB確率分母": st.column_config.NumberColumn("RB確率分母", min_value=1.0, format="%.2f"),
+            "合算分母": st.column_config.NumberColumn("合算分母", min_value=1.0, format="%.2f"),
+        },
+    )
+
+    if st.button("この公式スペックを保存", type="primary"):
+        try:
+            spec_rows = []
+            for _, r in edited.iterrows():
+                spec_rows.append(
+                    {
+                        "setting": int(r["設定"]),
+                        "bb_den": r["BB確率分母"],
+                        "rb_den": r["RB確率分母"],
+                        "combined_den": r["合算分母"],
+                    }
+                )
+            aliases = re.split(r"[\n,、]+", alias_text or "")
+            save_juggler_master(
+                machine_name=machine_name,
+                source_label=source_label,
+                source_url=source_url,
+                note=note,
+                aliases=aliases,
+                spec_rows=spec_rows,
+            )
+            st.success(f"{machine_name} の設定1～6スペックを保存しました。")
+            st.rerun()
+        except Exception as e:
+            st.error(f"保存できませんでした：{e}")
+
+    st.markdown("#### 登録済み公式スペック一覧")
+    master_list = query_df(
+        """
+        SELECT
+            m.machine_name AS "機種名",
+            v.setting AS "設定",
+            v.bb_den AS "BB確率分母",
+            v.rb_den AS "RB確率分母",
+            v.combined_den AS "合算分母",
+            m.source_label AS "情報元"
+        FROM slot_juggler_masters m
+        JOIN slot_juggler_spec_values v ON v.spec_id = m.spec_id
+        ORDER BY m.machine_name, v.setting
+        """
+    )
+    if master_list.empty:
+        st.info("公式スペックはまだ登録されていません。")
+    else:
+        st.dataframe(master_list, use_container_width=True, hide_index=True)
 
 
 elif menu == "店舗別イベント管理":
