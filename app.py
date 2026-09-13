@@ -1227,6 +1227,361 @@ def juggler_setting_fit(games, bb, rb, spec):
     }
 
 
+
+def _score_shrink(value, sample_count, prior=50.0, strength=5.0):
+    """少サンプルを50点へ縮小して、1～2日だけの上振れを過大評価しない。"""
+    if value is None or pd.isna(value):
+        return None
+    n = max(0.0, float(sample_count or 0))
+    return (float(value) * n + float(prior) * strength) / (n + strength)
+
+
+def _mean_and_n(df, value_col='fit_score'):
+    if df is None or df.empty or value_col not in df.columns:
+        return None, 0
+    vals = pd.to_numeric(df[value_col], errors='coerce').dropna()
+    if vals.empty:
+        return None, 0
+    return float(vals.mean()), int(len(vals))
+
+
+def _prediction_rank_label(score):
+    if score is None or pd.isna(score):
+        return '-'
+    score = float(score)
+    if score >= 70:
+        return 'S'
+    if score >= 60:
+        return 'A'
+    if score >= 50:
+        return 'B'
+    return 'C'
+
+
+def build_juggler_prediction(store_id, target_date, lookback_days=60):
+    """
+    前日までの情報だけを使ってジャグラーの狙い参考点を作る。
+    予測点は実設定の確率ではなく、店舗内の過去傾向を比較する相対スコア。
+    """
+    target_date = pd.Timestamp(target_date).date()
+    start_date = target_date - timedelta(days=int(lookback_days))
+
+    raw = query_df(
+        """
+        SELECT date, machine_no, machine_name, games, bb, rb, diff_medals
+        FROM slot_machine_results
+        WHERE store_id = %s
+          AND date >= %s
+          AND date < %s
+          AND machine_name IS NOT NULL
+          AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+        ORDER BY date, machine_no
+        """,
+        (store_id, start_date, target_date),
+    )
+    if raw.empty:
+        return pd.DataFrame(), {
+            'latest_data_date': None,
+            'target_events': [],
+            'missing_specs': [],
+            'history_start': start_date,
+        }
+
+    raw['date'] = pd.to_datetime(raw['date']).dt.date
+    raw['machine_no'] = pd.to_numeric(raw['machine_no'], errors='coerce')
+    raw = raw.dropna(subset=['machine_no', 'machine_name']).copy()
+    raw['machine_no'] = raw['machine_no'].astype(int)
+    raw['machine_name'] = raw['machine_name'].astype(str)
+    raw['games'] = pd.to_numeric(raw['games'], errors='coerce').fillna(0).astype(int)
+    raw['bb'] = pd.to_numeric(raw['bb'], errors='coerce').fillna(0).astype(int)
+    raw['rb'] = pd.to_numeric(raw['rb'], errors='coerce').fillna(0).astype(int)
+    raw['tail'] = raw['machine_no'] % 10
+    raw['weekday_no'] = pd.to_datetime(raw['date']).dt.weekday
+
+    latest_data_date = max(raw['date'])
+    roster = (
+        raw[raw['date'] == latest_data_date][['machine_no', 'machine_name']]
+        .drop_duplicates(subset=['machine_no'], keep='last')
+        .sort_values('machine_no')
+        .reset_index(drop=True)
+    )
+
+    name_map, _ = load_juggler_spec_map()
+    fit_scores = []
+    high_fits = []
+    setting6_fits = []
+    missing_specs = set()
+    for _, r in raw.iterrows():
+        spec = name_map.get(str(r['machine_name']))
+        if not spec:
+            missing_specs.add(str(r['machine_name']))
+            fit_scores.append(np.nan)
+            high_fits.append(np.nan)
+            setting6_fits.append(np.nan)
+            continue
+        fit = juggler_setting_fit(r['games'], r['bb'], r['rb'], spec)
+        if not fit:
+            fit_scores.append(np.nan)
+            high_fits.append(np.nan)
+            setting6_fits.append(np.nan)
+            continue
+        fit_scores.append(float(fit['aim_score']))
+        high_fits.append(float(fit['high_fit']))
+        setting6_fits.append(float(fit['setting6_fit']))
+
+    raw['fit_score'] = fit_scores
+    raw['high_fit'] = high_fits
+    raw['setting6_fit'] = setting6_fits
+    scored = raw[raw['fit_score'].notna()].copy()
+
+    # 対象日に登録されているイベント名を取得。未来日でも手入力イベントを利用できる。
+    target_event_df = query_df(
+        """
+        SELECT event_name
+        FROM slot_store_events
+        WHERE store_id = %s AND date = %s
+        ORDER BY event_name
+        """,
+        (store_id, target_date),
+    )
+    target_events = [] if target_event_df.empty else sorted(
+        set(target_event_df['event_name'].dropna().astype(str).tolist())
+    )
+
+    past_event_dates = set()
+    if target_events:
+        event_hist = query_df(
+            """
+            SELECT date, event_name
+            FROM slot_store_events
+            WHERE store_id = %s AND date < %s
+            """,
+            (store_id, target_date),
+        )
+        if not event_hist.empty:
+            event_hist['date'] = pd.to_datetime(event_hist['date']).dt.date
+            past_event_dates = set(
+                event_hist[event_hist['event_name'].astype(str).isin(target_events)]['date'].tolist()
+            )
+
+    target_weekday = pd.Timestamp(target_date).weekday()
+    recent_cut = target_date - timedelta(days=14)
+
+    # 前日（正確には対象日前の最新取得日）の並び判定用。
+    latest_scored = scored[scored['date'] == latest_data_date].copy()
+    latest_fit_by_no = dict(zip(latest_scored['machine_no'], latest_scored['fit_score']))
+
+    # 実績がある過去日を指定したときの答え合わせ用。
+    actual = query_df(
+        """
+        SELECT machine_no, machine_name, games, bb, rb
+        FROM slot_machine_results
+        WHERE store_id = %s
+          AND date = %s
+          AND machine_name IS NOT NULL
+          AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+        ORDER BY machine_no
+        """,
+        (store_id, target_date),
+    )
+    actual_map = {}
+    if not actual.empty:
+        for _, r in actual.iterrows():
+            name = str(r.get('machine_name') or '')
+            spec = name_map.get(name)
+            if not spec:
+                continue
+            fit = juggler_setting_fit(r.get('games'), r.get('bb'), r.get('rb'), spec)
+            if fit:
+                actual_map[int(r['machine_no'])] = {
+                    'actual_score': float(fit['aim_score']),
+                    'actual_high_fit': float(fit['high_fit']),
+                    'actual_judgement': fit['judgement'],
+                }
+
+    rows = []
+    component_labels = {
+        'recent_machine': '直近機種傾向',
+        'long_machine': '機種長期傾向',
+        'tail': '末尾傾向',
+        'weekday': '曜日傾向',
+        'event': 'イベント傾向',
+        'state': '上げ・据え傾向',
+        'neighbor': '隣接傾向',
+    }
+    weights = {
+        'recent_machine': 20.0,
+        'long_machine': 15.0,
+        'tail': 15.0,
+        'weekday': 10.0,
+        'event': 20.0,
+        'state': 15.0,
+        'neighbor': 5.0,
+    }
+
+    for _, cand in roster.iterrows():
+        no = int(cand['machine_no'])
+        name = str(cand['machine_name'])
+        spec = name_map.get(name)
+        hist_name = scored[scored['machine_name'] == name]
+        hist_no = hist_name[hist_name['machine_no'] == no]
+        history_days = int(hist_name['date'].nunique()) if not hist_name.empty else 0
+        first_seen = min(raw[raw['machine_name'] == name]['date']) if not raw[raw['machine_name'] == name].empty else None
+
+        if not spec:
+            rows.append({
+                '台番号': no,
+                '機種名': name,
+                '狙い点': np.nan,
+                'ランク': '-',
+                '信頼度': '公式スペック未登録',
+                '新台': '新台/履歴少' if history_days <= 2 else '',
+                '履歴日数': history_days,
+                '末尾': no % 10,
+                '推奨理由': '公式スペック登録待ち',
+                '前回判別点': np.nan,
+                '上げ・据え': '-',
+                '実績判別点': actual_map.get(no, {}).get('actual_score', np.nan),
+                '実績判定': actual_map.get(no, {}).get('actual_judgement', '-'),
+            })
+            continue
+
+        components = {}
+        counts = {}
+
+        # 同一機種の直近14日と長期傾向。
+        recent = hist_name[hist_name['date'] >= recent_cut]
+        val, n = _mean_and_n(recent)
+        if val is not None:
+            components['recent_machine'] = _score_shrink(val, n, strength=4.0)
+            counts['recent_machine'] = n
+
+        val, n = _mean_and_n(hist_name)
+        if val is not None:
+            components['long_machine'] = _score_shrink(val, n, strength=8.0)
+            counts['long_machine'] = n
+
+        # 末尾は全ジャグラーを対象に店舗固有のクセを見る。
+        tail_df = scored[scored['tail'] == (no % 10)]
+        val, n = _mean_and_n(tail_df)
+        if val is not None:
+            components['tail'] = _score_shrink(val, n, strength=10.0)
+            counts['tail'] = n
+
+        weekday_df = hist_name[hist_name['weekday_no'] == target_weekday]
+        val, n = _mean_and_n(weekday_df)
+        if val is not None:
+            components['weekday'] = _score_shrink(val, n, strength=6.0)
+            counts['weekday'] = n
+
+        if past_event_dates:
+            event_df = hist_name[hist_name['date'].isin(past_event_dates)]
+            val, n = _mean_and_n(event_df)
+            if val is not None:
+                components['event'] = _score_shrink(val, n, strength=4.0)
+                counts['event'] = n
+
+        # 上げ/据え：同じ台・同じ機種の連続日ペアから、前回状態に似たケースを探す。
+        prev_row = hist_no[hist_no['date'] == latest_data_date]
+        prev_fit = None
+        state_label = '-'
+        if not prev_row.empty:
+            prev_fit = float(prev_row.iloc[-1]['fit_score'])
+            pair = hist_no[['date', 'fit_score']].sort_values('date').copy()
+            pair['next_date'] = pair['date'].shift(-1)
+            pair['next_fit'] = pair['fit_score'].shift(-1)
+            pair['gap'] = [
+                ((nxt - cur).days if pd.notna(nxt) else None)
+                for cur, nxt in zip(pair['date'], pair['next_date'])
+            ]
+            pair = pair[(pair['gap'] == 1) & pair['next_fit'].notna()]
+            if prev_fit >= 50:
+                similar = pair[pair['fit_score'] >= 50]
+                state_label = '据え傾向'
+            elif prev_fit <= 25:
+                similar = pair[pair['fit_score'] <= 25]
+                state_label = '上げ傾向'
+            else:
+                similar = pair[(pair['fit_score'] > 25) & (pair['fit_score'] < 50)]
+                state_label = '中間帯'
+            vals = pd.to_numeric(similar['next_fit'], errors='coerce').dropna()
+            if not vals.empty:
+                components['state'] = _score_shrink(float(vals.mean()), len(vals), strength=4.0)
+                counts['state'] = int(len(vals))
+
+        # 前回データの隣台が強かったか。並びを軽く加点する補助指標。
+        neighbor_vals = []
+        for neighbor_no in (no - 1, no + 1):
+            v = latest_fit_by_no.get(neighbor_no)
+            if v is not None and not pd.isna(v):
+                neighbor_vals.append(float(v))
+        if neighbor_vals:
+            components['neighbor'] = float(max(neighbor_vals))
+            counts['neighbor'] = len(neighbor_vals)
+
+        available_weight = sum(weights[k] for k in components)
+        if available_weight > 0:
+            total_score = sum(components[k] * weights[k] for k in components) / available_weight
+        else:
+            total_score = np.nan
+
+        if history_days >= 20:
+            confidence = '高'
+        elif history_days >= 7:
+            confidence = '中'
+        elif history_days >= 3:
+            confidence = '低'
+        else:
+            confidence = '新台/履歴不足'
+
+        # 推奨理由は平均との差が大きい上位2要素を表示。
+        reasons = sorted(
+            [(k, v) for k, v in components.items()],
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:2]
+        reason_text = ' / '.join(
+            f"{component_labels[k]} {v:.0f}点" for k, v in reasons
+        ) if reasons else '-'
+
+        rows.append({
+            '台番号': no,
+            '機種名': name,
+            '狙い点': round(float(total_score), 1) if not pd.isna(total_score) else np.nan,
+            'ランク': _prediction_rank_label(total_score),
+            '信頼度': confidence,
+            '新台': '新台/履歴少' if history_days <= 2 else '',
+            '履歴日数': history_days,
+            '末尾': no % 10,
+            '推奨理由': reason_text,
+            '前回判別点': round(prev_fit, 1) if prev_fit is not None else np.nan,
+            '上げ・据え': state_label,
+            '実績判別点': round(actual_map.get(no, {}).get('actual_score', np.nan), 1)
+                if no in actual_map else np.nan,
+            '実績判定': actual_map.get(no, {}).get('actual_judgement', '-'),
+            '直近機種点': round(components.get('recent_machine', np.nan), 1),
+            '機種長期点': round(components.get('long_machine', np.nan), 1),
+            '末尾点': round(components.get('tail', np.nan), 1),
+            '曜日点': round(components.get('weekday', np.nan), 1),
+            'イベント点': round(components.get('event', np.nan), 1),
+            '上げ据え点': round(components.get('state', np.nan), 1),
+            '隣接点': round(components.get('neighbor', np.nan), 1),
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values(['狙い点', '台番号'], ascending=[False, True], na_position='last')
+
+    meta = {
+        'latest_data_date': latest_data_date,
+        'target_events': target_events,
+        'missing_specs': sorted(missing_specs, key=kana_sort_key),
+        'history_start': start_date,
+        'actual_available': bool(actual_map),
+    }
+    return result, meta
+
+
 def save_juggler_master(machine_name, source_label, source_url, note, aliases, spec_rows):
     machine_name = str(machine_name or "").strip()
     if not machine_name:
@@ -2964,6 +3319,7 @@ menu = st.sidebar.radio(
         "日別集計",
         "機種別分析",
         "台番号別分析",
+        "明日のジャグラー狙い",
         "ジャグラー設定判別",
         "ジャグラー公式スペック管理",
         "店舗別イベント管理",
@@ -3513,6 +3869,150 @@ elif menu == "台番号別分析":
     )
 
 
+elif menu == "明日のジャグラー狙い":
+    st.subheader("🎯 明日のジャグラー狙い")
+    st.write(
+        "対象日の前日までのデータだけを使い、店舗ごとの機種傾向・末尾・曜日・イベント・"
+        "上げ/据え・隣接傾向を組み合わせて狙い参考点を出します。"
+    )
+    st.caption(
+        "狙い点は『設定が入る確率』ではありません。過去傾向を比較するための相対スコアです。"
+        "過去日を選べば、その日以降の情報を使わずに答え合わせできます。"
+    )
+
+    store_id, store_name = store_selector()
+    if store_id is None:
+        st.info("店舗データがありません。")
+        st.stop()
+
+    bounds = query_df(
+        """
+        SELECT MIN(date) AS min_date, MAX(date) AS max_date
+        FROM slot_machine_results
+        WHERE store_id = %s
+          AND machine_name IS NOT NULL
+          AND (machine_name ILIKE '%%ジャグラー%%' OR machine_name ILIKE '%%JUGGLER%%')
+        """,
+        (store_id,),
+    )
+    if bounds.empty or pd.isna(bounds.iloc[0]['max_date']):
+        st.info("この店舗にはジャグラー系データがまだありません。")
+        st.stop()
+
+    min_date = pd.Timestamp(bounds.iloc[0]['min_date']).date()
+    max_date = pd.Timestamp(bounds.iloc[0]['max_date']).date()
+    default_target = max_date + timedelta(days=1)
+
+    c1, c2 = st.columns(2)
+    target_date = c1.date_input(
+        "狙う日",
+        value=default_target,
+        min_value=min_date + timedelta(days=1),
+        max_value=max(default_target + timedelta(days=365), datetime.now().date() + timedelta(days=365)),
+        key="juggler_target_date",
+    )
+    lookback_days = c2.selectbox(
+        "学習期間",
+        [30, 60, 90, 180],
+        index=1,
+        format_func=lambda x: f"直近{x}日",
+        key="juggler_prediction_lookback",
+    )
+
+    result, meta = build_juggler_prediction(store_id, target_date, lookback_days)
+    if result.empty:
+        st.info("対象日前に予測へ使えるジャグラーデータがありません。")
+        st.stop()
+
+    latest_data_date = meta.get('latest_data_date')
+    st.info(
+        f"予測に使った最終データ：{latest_data_date} ／ 狙う日：{target_date} ／ "
+        f"学習期間：直近{lookback_days}日"
+    )
+
+    if meta.get('target_events'):
+        st.success("対象日に登録済みイベント：" + "、".join(meta['target_events']))
+    else:
+        st.caption("対象日のイベント登録はありません。イベントが分かっていれば『店舗別イベント管理』から追加できます。")
+
+    if meta.get('missing_specs'):
+        st.warning(
+            "公式スペック未登録のジャグラーがあります："
+            + "、".join(meta['missing_specs'])
+        )
+        st.write(
+            "新台は自動で検出します。左メニューの『ジャグラー公式スペック管理』で設定1～6を一度登録すると、"
+            "全店舗で共通利用されます。未登録中は誤判定を避けるため狙い点を出しません。"
+        )
+
+    scored = result[result['狙い点'].notna()].copy()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("候補台数", f"{len(result):,}台")
+    c2.metric("判定可能", f"{len(scored):,}台")
+    if not scored.empty:
+        c3.metric("最高狙い点", f"{scored['狙い点'].max():.1f}点")
+        c4.metric("S/Aランク", f"{int(scored['ランク'].isin(['S', 'A']).sum()):,}台")
+    else:
+        c3.metric("最高狙い点", "-")
+        c4.metric("S/Aランク", "-")
+
+    machine_options = sorted(result['機種名'].dropna().astype(str).unique().tolist(), key=kana_sort_key)
+    selected_machines = st.multiselect(
+        "機種を絞り込み（複数選択可・カナ順）",
+        machine_options,
+        placeholder="未選択なら全ジャグラー",
+        key="juggler_prediction_machine_filter",
+    )
+    display = result.copy()
+    if selected_machines:
+        display = display[display['機種名'].isin(selected_machines)].copy()
+
+    st.markdown("#### 狙いランキング")
+    main_cols = [
+        'ランク', '狙い点', '台番号', '機種名', '信頼度', '新台', '履歴日数', '末尾',
+        '前回判別点', '上げ・据え', '推奨理由'
+    ]
+    if meta.get('actual_available'):
+        main_cols += ['実績判別点', '実績判定']
+    st.dataframe(display[main_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("点数の内訳を見る"):
+        detail_cols = [
+            '台番号', '機種名', '狙い点', '直近機種点', '機種長期点', '末尾点', '曜日点',
+            'イベント点', '上げ据え点', '隣接点'
+        ]
+        st.dataframe(display[detail_cols], use_container_width=True, hide_index=True)
+
+    if meta.get('actual_available'):
+        actual_rows = scored[scored['実績判別点'].notna()].copy()
+        if not actual_rows.empty:
+            top_n = min(10, len(actual_rows))
+            top = actual_rows.head(top_n)
+            st.markdown("#### 過去日を選んだ場合の答え合わせ")
+            c1, c2, c3 = st.columns(3)
+            c1.metric(f"予測上位{top_n}台 実績平均", f"{top['実績判別点'].mean():.1f}点")
+            c2.metric(
+                f"上位{top_n}台 実績50点以上",
+                f"{int((top['実績判別点'] >= 50).sum())}/{top_n}台",
+            )
+            all_avg = actual_rows['実績判別点'].mean()
+            c3.metric("全候補 実績平均", f"{all_avg:.1f}点")
+            st.caption(
+                "この答え合わせでも対象日当日のBB/RBは予測計算には使わず、表示後の検証だけに使っています。"
+            )
+
+    st.markdown("#### 新台の扱い")
+    st.write(
+        "新しいジャグラーが初めてJSONに出ると自動で新台候補として検出します。"
+        "公式スペックが未登録なら狙い点は保留し、設定1～6を登録した時点から判別を開始します。"
+        "履歴が1～2日しかない間は『新台/履歴不足』と表示し、少数日の上振れをそのまま高評価しないよう50点側へ補正します。"
+    )
+    st.caption(
+        "発売前に機種名と公式スペックが分かっている場合は、先に『ジャグラー公式スペック管理』へ手入力しておけます。"
+        "ただし台番号・設置位置は店舗データへ初めて出るまで分からないため、台番号別の狙いは初回JSON取得後からです。"
+    )
+
+
 elif menu == "ジャグラー設定判別":
     st.subheader("🤡 ジャグラー設定判別")
     st.write(
@@ -3727,7 +4227,11 @@ elif menu == "ジャグラー公式スペック管理":
     st.subheader("📘 ジャグラー公式スペック管理")
     st.write(
         "ジャグラーの設定1～6について、公式BB確率・RB確率・合算を登録します。"
-        "一度登録すれば全店舗で共通利用できます。新台もここへ追加するだけで対応できます。"
+        "一度登録すれば全店舗で共通利用できます。新台もここへ1回追加するだけで対応できます。"
+    )
+    st.info(
+        "新台対応：JSONで新しいジャグラー名を検出 → 未登録表示 → 設定1～6の公式値を登録 → "
+        "以後は全店舗で自動判別、という流れです。発売前でも機種名と公式値が分かれば先に登録できます。"
     )
 
     if not admin_gate():
