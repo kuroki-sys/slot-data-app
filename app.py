@@ -57,15 +57,23 @@ def init_db():
         diff_medals INTEGER,
         bb INTEGER,
         rb INTEGER,
+        art INTEGER,
         combined_rate NUMERIC,
         bb_rate NUMERIC,
         rb_rate NUMERIC,
+        art_rate NUMERIC,
         combined_rate_text TEXT,
         bb_rate_text TEXT,
         rb_rate_text TEXT,
+        art_rate_text TEXT,
         source_url TEXT,
         PRIMARY KEY (date, store_id, machine_no)
     );
+
+    -- 既存DBを壊さず、多店舗でART/AT系も保存できるように列を追加する。
+    ALTER TABLE slot_machine_results ADD COLUMN IF NOT EXISTS art INTEGER;
+    ALTER TABLE slot_machine_results ADD COLUMN IF NOT EXISTS art_rate NUMERIC;
+    ALTER TABLE slot_machine_results ADD COLUMN IF NOT EXISTS art_rate_text TEXT;
 
     CREATE TABLE IF NOT EXISTS slot_import_log (
         import_id BIGSERIAL PRIMARY KEY,
@@ -77,18 +85,22 @@ def init_db():
         exported_at TEXT,
         source_table_count INTEGER,
         imported_machine_rows INTEGER,
-        source_sha256 TEXT UNIQUE
+        source_sha256 TEXT UNIQUE,
+        source_headers TEXT,
+        import_notes TEXT
     );
+
+    ALTER TABLE slot_import_log ADD COLUMN IF NOT EXISTS source_headers TEXT;
+    ALTER TABLE slot_import_log ADD COLUMN IF NOT EXISTS import_notes TEXT;
 
     CREATE INDEX IF NOT EXISTS idx_slot_machine_results_store_date
         ON slot_machine_results(store_id, date);
-
     CREATE INDEX IF NOT EXISTS idx_slot_machine_results_machine_name
         ON slot_machine_results(machine_name);
-
     CREATE INDEX IF NOT EXISTS idx_slot_machine_results_machine_no
         ON slot_machine_results(machine_no);
 
+    -- 旧テーブルは互換性のため残す。新規イベント管理は slot_store_events を使用する。
     CREATE TABLE IF NOT EXISTS slot_special_events (
         date DATE NOT NULL,
         store_id BIGINT NOT NULL REFERENCES slot_stores(store_id) ON DELETE CASCADE,
@@ -100,14 +112,56 @@ def init_db():
         PRIMARY KEY (date, store_id)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_slot_special_events_store_date
-        ON slot_special_events(store_id, date);
+    CREATE TABLE IF NOT EXISTS slot_store_events (
+        event_id BIGSERIAL PRIMARY KEY,
+        date DATE NOT NULL,
+        store_id BIGINT NOT NULL REFERENCES slot_stores(store_id) ON DELETE CASCADE,
+        event_name TEXT NOT NULL,
+        event_tags TEXT,
+        full_machine_names TEXT,
+        half_machine_names TEXT,
+        tail_targets TEXT,
+        line_targets TEXT,
+        other_features TEXT,
+        source_label TEXT,
+        confidence TEXT,
+        note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (store_id, date, event_name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_slot_store_events_store_date
+        ON slot_store_events(store_id, date);
+    CREATE INDEX IF NOT EXISTS idx_slot_store_events_name
+        ON slot_store_events(store_id, event_name);
+
+    CREATE TABLE IF NOT EXISTS slot_schema_migrations (
+        migration_key TEXT PRIMARY KEY,
+        migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- 旧イベント表の内容は最初の1回だけ新テーブルへコピーする。
+    INSERT INTO slot_store_events
+        (date, store_id, event_name, event_tags, source_label, confidence, note)
+    SELECT
+        date, store_id, event_name, event_tags, source_label, confidence, note
+    FROM slot_special_events
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM slot_schema_migrations
+        WHERE migration_key = 'special_events_to_store_events_v1'
+    )
+    ON CONFLICT (store_id, date, event_name) DO NOTHING;
+
+    INSERT INTO slot_schema_migrations(migration_key)
+    VALUES ('special_events_to_store_events_v1')
+    ON CONFLICT (migration_key) DO NOTHING;
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
         conn.commit()
-
 
 
 SPECIAL_EVENT_STORE_NAME = "BIGディッパー新橋1号店"
@@ -192,10 +246,29 @@ def split_event_tags(value):
     return [p.strip() for p in parts if p.strip()]
 
 
+def text_or_blank(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value)
+
+
 def seed_special_event_defaults():
-    """画像から判読できた範囲のイベント名を冪等に仮登録する。"""
+    """新橋の画像由来の初期イベントは最初の1回だけ登録する。"""
+    migration_key = "shimbashi_image_seed_v1"
     with get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM slot_schema_migrations WHERE migration_key = %s",
+                (migration_key,),
+            )
+            if cur.fetchone():
+                return
+
             cur.execute(
                 "SELECT store_id FROM slot_stores WHERE store_name = %s",
                 (SPECIAL_EVENT_STORE_NAME,),
@@ -208,10 +281,10 @@ def seed_special_event_defaults():
             for date_str, event_name, event_tags in SPECIAL_EVENT_SEEDS:
                 cur.execute(
                     """
-                    INSERT INTO slot_special_events
+                    INSERT INTO slot_store_events
                     (date, store_id, event_name, event_tags, source_label, confidence, note)
                     VALUES (%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT(date, store_id) DO NOTHING
+                    ON CONFLICT (store_id, date, event_name) DO NOTHING
                     """,
                     (
                         date_str,
@@ -220,58 +293,122 @@ def seed_special_event_defaults():
                         event_tags,
                         "ぽこ独自調べ「仕掛け一覧」画像（ユーザー提供）",
                         "画像から判読できた範囲",
-                        "イベント名のみ仮登録。画像の機種欄・その他仕掛けは誤読防止のため自動転記していません。",
+                        "イベント名のみ初期登録。細かい機種欄・その他仕掛けは誤読防止のため自動転記していません。",
                     ),
                 )
+
+            cur.execute(
+                """
+                INSERT INTO slot_schema_migrations(migration_key)
+                VALUES (%s)
+                ON CONFLICT (migration_key) DO NOTHING
+                """,
+                (migration_key,),
+            )
         conn.commit()
 
 
-def upsert_special_event(
+def create_store_by_name(store_name):
+    name = str(store_name or "").strip()
+    if not name:
+        raise ValueError("店舗名を入力してください。")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            store_id = get_or_create_store_id(cur, name)
+        conn.commit()
+    clear_cache()
+    return store_id
+
+
+def save_store_event(
     store_id,
     event_date,
     event_name,
-    event_tags,
-    note="",
-    confidence="手入力",
+    event_tags="",
+    full_machine_names="",
+    half_machine_names="",
+    tail_targets="",
+    line_targets="",
+    other_features="",
     source_label="アプリ手入力",
+    confidence="手入力",
+    note="",
+    event_id=None,
 ):
+    name = str(event_name or "").strip()
+    if not name:
+        raise ValueError("イベント名を入力してください。")
+
+    values = (
+        event_date,
+        store_id,
+        name,
+        str(event_tags or name).strip(),
+        str(full_machine_names or "").strip(),
+        str(half_machine_names or "").strip(),
+        str(tail_targets or "").strip(),
+        str(line_targets or "").strip(),
+        str(other_features or "").strip(),
+        str(source_label or "").strip(),
+        str(confidence or "").strip(),
+        str(note or "").strip(),
+    )
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO slot_special_events
-                (date, store_id, event_name, event_tags, source_label, confidence, note)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT(date, store_id) DO UPDATE SET
-                    event_name = EXCLUDED.event_name,
-                    event_tags = EXCLUDED.event_tags,
-                    source_label = EXCLUDED.source_label,
-                    confidence = EXCLUDED.confidence,
-                    note = EXCLUDED.note
-                """,
-                (
-                    event_date,
-                    store_id,
-                    event_name.strip(),
-                    event_tags.strip(),
-                    source_label,
-                    confidence,
-                    note.strip(),
-                ),
-            )
+            if event_id is None:
+                cur.execute(
+                    """
+                    INSERT INTO slot_store_events
+                    (date, store_id, event_name, event_tags, full_machine_names,
+                     half_machine_names, tail_targets, line_targets, other_features,
+                     source_label, confidence, note)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (store_id, date, event_name) DO UPDATE SET
+                        event_tags = EXCLUDED.event_tags,
+                        full_machine_names = EXCLUDED.full_machine_names,
+                        half_machine_names = EXCLUDED.half_machine_names,
+                        tail_targets = EXCLUDED.tail_targets,
+                        line_targets = EXCLUDED.line_targets,
+                        other_features = EXCLUDED.other_features,
+                        source_label = EXCLUDED.source_label,
+                        confidence = EXCLUDED.confidence,
+                        note = EXCLUDED.note,
+                        updated_at = NOW()
+                    """,
+                    values,
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE slot_store_events
+                    SET date=%s,
+                        store_id=%s,
+                        event_name=%s,
+                        event_tags=%s,
+                        full_machine_names=%s,
+                        half_machine_names=%s,
+                        tail_targets=%s,
+                        line_targets=%s,
+                        other_features=%s,
+                        source_label=%s,
+                        confidence=%s,
+                        note=%s,
+                        updated_at=NOW()
+                    WHERE event_id=%s
+                    """,
+                    values + (int(event_id),),
+                )
         conn.commit()
     clear_cache()
 
 
-def delete_special_event(store_id, event_date):
+def delete_store_event(store_id, event_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                DELETE FROM slot_special_events
-                WHERE store_id = %s AND date = %s
-                """,
-                (store_id, event_date),
+                "DELETE FROM slot_store_events WHERE store_id=%s AND event_id=%s",
+                (store_id, int(event_id)),
             )
         conn.commit()
     clear_cache()
@@ -287,21 +424,26 @@ def get_special_event_tags(events_df):
 
 
 def matching_special_event_dates(events_df, target_date, selected_tags):
+    """同じ日に複数イベントがある場合は、その日のタグを合算して照合する。"""
     if events_df is None or events_df.empty or not selected_tags:
         return []
 
     target_ts = pd.Timestamp(target_date)
-    matched = []
+    grouped_tags = {}
 
     for _, row in events_df.iterrows():
         row_date = pd.Timestamp(row["date"])
         if row_date >= target_ts:
             continue
+        grouped_tags.setdefault(row_date, set()).update(
+            split_event_tags(row.get("event_tags", ""))
+        )
 
-        row_tags = set(split_event_tags(row.get("event_tags", "")))
-        if all(tag in row_tags for tag in selected_tags):
-            matched.append(row_date)
-
+    matched = [
+        row_date
+        for row_date, tags in grouped_tags.items()
+        if all(tag in tags for tag in selected_tags)
+    ]
     return sorted(set(matched))
 
 
@@ -368,12 +510,15 @@ def kana_sort_key(value):
 
 
 def parse_page_title(raw):
-    title = raw.get("page_title", "")
-    m = re.match(r"(\d{4})/(\d{2})/(\d{2})\s+(.+?)\s+データまとめ", title)
+    title = str(raw.get("page_title", "") or "").strip()
+    m = re.search(
+        r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s+(.+?)\s+データまとめ",
+        title,
+    )
     if not m:
         raise ValueError(f"ページタイトルから日付・店舗名を判定できません: {title}")
-    date_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    store_name = m.group(4)
+    date_str = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    store_name = m.group(4).strip()
     return date_str, store_name
 
 
@@ -383,7 +528,28 @@ def weekday_jp(date_str):
     ]
 
 
+def normalize_header(value):
+    return re.sub(r"[\s　]+", "", str(value or "")).strip()
+
+
+def build_header_map(header_row):
+    return {
+        normalize_header(name): idx
+        for idx, name in enumerate(header_row or [])
+        if normalize_header(name)
+    }
+
+
+def get_by_headers(row, header_map, *aliases):
+    for alias in aliases:
+        idx = header_map.get(normalize_header(alias))
+        if idx is not None and idx < len(row):
+            return row[idx]
+    return None
+
+
 def parse_anaslo_json(raw):
+    """アナスロJSONをヘッダー名で解析する。店舗ごとの列順違いで誤読しない。"""
     date_str, store_name = parse_page_title(raw)
     source_url = raw.get("page_url", "")
 
@@ -394,61 +560,129 @@ def parse_anaslo_json(raw):
     if not all_table:
         raise ValueError('id="all_data_table" が見つかりません。')
 
+    rows = all_table.get("rows", [])
+    if not rows:
+        raise ValueError("all_data_table にデータがありません。")
+
+    header_row = rows[0]
+    header_map = build_header_map(header_row)
+    detected_headers = [str(x) for x in header_row]
+
+    required = ["台番号", "G数"]
+    missing_required = [h for h in required if normalize_header(h) not in header_map]
+    if missing_required:
+        raise ValueError(
+            "必須列が見つかりません: " + ", ".join(missing_required)
+        )
+
+    has_diff_column = any(
+        normalize_header(x) in header_map
+        for x in ["差枚", "差枚数", "差メダル", "差枚数(枚)"]
+    )
+
     machine_rows = []
-    for r in all_table.get("rows", [])[1:]:
-        if len(r) < 9:
-            continue
-        machine_no = clean_int(r[1])
+    for r in rows[1:]:
+        machine_no = clean_int(get_by_headers(r, header_map, "台番号"))
         if machine_no is None:
             continue
+
+        combined_text = get_by_headers(r, header_map, "合成確率", "合算", "合算確率")
+        bb_rate_text = get_by_headers(r, header_map, "BB確率")
+        rb_rate_text = get_by_headers(r, header_map, "RB確率")
+        art_rate_text = get_by_headers(r, header_map, "ART確率", "AT確率")
+
         machine_rows.append(
             {
-                "machine_name": r[0],
+                "machine_name": str(
+                    get_by_headers(r, header_map, "機種名") or ""
+                ).strip(),
                 "machine_no": machine_no,
-                "games": clean_int(r[2]),
-                "diff_medals": clean_int(r[3]),
-                "bb": clean_int(r[4]),
-                "rb": clean_int(r[5]),
-                "combined_rate": rate_num(r[6]),
-                "bb_rate": rate_num(r[7]),
-                "rb_rate": rate_num(r[8]),
-                "combined_rate_text": str(r[6]),
-                "bb_rate_text": str(r[7]),
-                "rb_rate_text": str(r[8]),
+                "games": clean_int(get_by_headers(r, header_map, "G数", "ゲーム数")),
+                "diff_medals": clean_int(
+                    get_by_headers(r, header_map, "差枚", "差枚数", "差メダル", "差枚数(枚)")
+                ) if has_diff_column else None,
+                "bb": clean_int(get_by_headers(r, header_map, "BB")),
+                "rb": clean_int(get_by_headers(r, header_map, "RB")),
+                "art": clean_int(get_by_headers(r, header_map, "ART", "AT")),
+                "combined_rate": rate_num(combined_text),
+                "bb_rate": rate_num(bb_rate_text),
+                "rb_rate": rate_num(rb_rate_text),
+                "art_rate": rate_num(art_rate_text),
+                "combined_rate_text": str(combined_text or ""),
+                "bb_rate_text": str(bb_rate_text or ""),
+                "rb_rate_text": str(rb_rate_text or ""),
+                "art_rate_text": str(art_rate_text or ""),
             }
         )
+
+    if not machine_rows:
+        raise ValueError("台別データを1件も取得できませんでした。")
+
+    has_diff_data = has_diff_column and any(
+        r["diff_medals"] is not None for r in machine_rows
+    )
 
     summary_table = next(
         (
             t
             for t in raw.get("tables", [])
             if "total_get_medals_table" in str(t.get("class") or "")
+            or t.get("id") == "total_get_medals_table"
         ),
         None,
     )
 
-    if summary_table and len(summary_table.get("rows", [])) >= 2:
-        vals = summary_table["rows"][1]
-        total_diff = clean_int(vals[0])
-        avg_diff = clean_int(vals[1])
-        avg_games = clean_int(vals[2])
-        m = re.search(r"([\d.]+)%\((\d+)/(\d+)\)", str(vals[3]))
-        win_rate = float(m.group(1)) if m else None
-        win_count = int(m.group(2)) if m else None
-        machine_count = int(m.group(3)) if m else len(machine_rows)
-    else:
-        machine_count = len(machine_rows)
-        total_diff = sum((r["diff_medals"] or 0) for r in machine_rows)
-        avg_diff = round(total_diff / machine_count) if machine_count else None
-        avg_games = (
-            round(sum((r["games"] or 0) for r in machine_rows) / machine_count)
-            if machine_count
-            else None
-        )
-        win_count = sum(1 for r in machine_rows if (r["diff_medals"] or 0) > 0)
-        win_rate = round(win_count / machine_count * 100, 1) if machine_count else None
+    total_diff = None
+    avg_diff = None
+    avg_games = None
+    win_rate = None
+    win_count = None
+    machine_count = len(machine_rows)
 
-    calc_sum = sum((r["diff_medals"] or 0) for r in machine_rows)
+    if summary_table and len(summary_table.get("rows", [])) >= 2:
+        srows = summary_table["rows"]
+        smap = build_header_map(srows[0])
+        vals = srows[1]
+
+        total_diff = clean_int(get_by_headers(vals, smap, "総差枚"))
+        avg_diff = clean_int(get_by_headers(vals, smap, "平均差枚"))
+        avg_games = clean_int(get_by_headers(vals, smap, "平均G数", "平均ゲーム数"))
+        win_text = get_by_headers(vals, smap, "勝率")
+        m = re.search(r"([\d.]+)%\((\d+)/(\d+)\)", str(win_text or ""))
+        if m:
+            win_rate = float(m.group(1))
+            win_count = int(m.group(2))
+            machine_count = int(m.group(3))
+
+    if avg_games is None:
+        games_values = [r["games"] for r in machine_rows if r["games"] is not None]
+        avg_games = round(sum(games_values) / len(games_values)) if games_values else None
+
+    calc_sum = None
+    if has_diff_data:
+        calc_sum = sum((r["diff_medals"] or 0) for r in machine_rows)
+        if total_diff is None:
+            total_diff = calc_sum
+        if avg_diff is None:
+            avg_diff = round(calc_sum / len(machine_rows)) if machine_rows else None
+        if win_count is None:
+            win_count = sum(1 for r in machine_rows if (r["diff_medals"] or 0) > 0)
+        if win_rate is None:
+            win_rate = round(win_count / len(machine_rows) * 100, 1) if machine_rows else None
+    else:
+        # 差枚列がない店舗では、BBなどを差枚として誤登録しない。
+        total_diff = None
+        avg_diff = None
+        win_rate = None
+        win_count = None
+
+    notes = []
+    if has_diff_data:
+        notes.append("差枚列あり")
+        if total_diff is not None and calc_sum is not None and total_diff != calc_sum:
+            notes.append("店総差枚と台別差枚合計が不一致")
+    else:
+        notes.append("差枚列なし：差枚系項目は空欄で安全登録")
 
     return {
         "date": date_str,
@@ -466,6 +700,9 @@ def parse_anaslo_json(raw):
         "source_table_count": raw.get("table_count"),
         "machine_rows": machine_rows,
         "calc_sum": calc_sum,
+        "has_diff_data": has_diff_data,
+        "detected_headers": detected_headers,
+        "import_notes": " / ".join(notes),
     }
 
 
@@ -507,21 +744,25 @@ def import_parsed_json(parsed, source_sha256):
             machine_sql = """
                 INSERT INTO slot_machine_results
                 (date, store_id, machine_no, machine_name, games, diff_medals,
-                 bb, rb, combined_rate, bb_rate, rb_rate, combined_rate_text,
-                 bb_rate_text, rb_rate_text, source_url)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 bb, rb, art, combined_rate, bb_rate, rb_rate, art_rate,
+                 combined_rate_text, bb_rate_text, rb_rate_text, art_rate_text,
+                 source_url)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(date, store_id, machine_no) DO UPDATE SET
                     machine_name = EXCLUDED.machine_name,
                     games = EXCLUDED.games,
                     diff_medals = EXCLUDED.diff_medals,
                     bb = EXCLUDED.bb,
                     rb = EXCLUDED.rb,
+                    art = EXCLUDED.art,
                     combined_rate = EXCLUDED.combined_rate,
                     bb_rate = EXCLUDED.bb_rate,
                     rb_rate = EXCLUDED.rb_rate,
+                    art_rate = EXCLUDED.art_rate,
                     combined_rate_text = EXCLUDED.combined_rate_text,
                     bb_rate_text = EXCLUDED.bb_rate_text,
                     rb_rate_text = EXCLUDED.rb_rate_text,
+                    art_rate_text = EXCLUDED.art_rate_text,
                     source_url = EXCLUDED.source_url
             """
             params = []
@@ -536,23 +777,27 @@ def import_parsed_json(parsed, source_sha256):
                         r["diff_medals"],
                         r["bb"],
                         r["rb"],
+                        r.get("art"),
                         r["combined_rate"],
                         r["bb_rate"],
                         r["rb_rate"],
+                        r.get("art_rate"),
                         r["combined_rate_text"],
                         r["bb_rate_text"],
                         r["rb_rate_text"],
+                        r.get("art_rate_text", ""),
                         parsed["source_url"],
                     )
                 )
-            cur.executemany(machine_sql, params)
+            batch_executemany(cur, machine_sql, params, 1000)
 
             cur.execute(
                 """
                 INSERT INTO slot_import_log
                 (target_date, store_name, source_url, source_title, exported_at,
-                 source_table_count, imported_machine_rows, source_sha256)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                 source_table_count, imported_machine_rows, source_sha256,
+                 source_headers, import_notes)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(source_sha256) DO NOTHING
                 """,
                 (
@@ -564,6 +809,8 @@ def import_parsed_json(parsed, source_sha256):
                     parsed["source_table_count"],
                     len(parsed["machine_rows"]),
                     source_sha256,
+                    " / ".join(parsed.get("detected_headers", [])),
+                    parsed.get("import_notes", ""),
                 ),
             )
         conn.commit()
@@ -2426,7 +2673,7 @@ menu = st.sidebar.radio(
         "日別集計",
         "機種別分析",
         "台番号別分析",
-        "特定日・仕掛け実績",
+        "店舗別イベント管理",
         "狙い分析",
     ],
 )
@@ -2445,6 +2692,7 @@ if menu == "ダッシュボード":
             MIN(date) AS start_date,
             MAX(date) AS end_date,
             COUNT(*) AS registered_days,
+            COUNT(total_diff_medals) AS diff_days,
             SUM(total_diff_medals) AS total_diff,
             SUM(CASE WHEN total_diff_medals > 0 THEN 1 ELSE 0 END) AS plus_days,
             SUM(CASE WHEN total_diff_medals < 0 THEN 1 ELSE 0 END) AS minus_days
@@ -2467,7 +2715,10 @@ if menu == "ダッシュボード":
     c1.metric("登録期間", f"{summary['start_date']} ～ {summary['end_date']}")
     c2.metric("登録日数", f"{int(summary['registered_days']):,}日")
     c3.metric("台別データ", f"{int(machine_count):,}件")
-    c4.metric("期間総差枚", f"{int(summary['total_diff'] or 0):+,}枚")
+    if int(summary.get("diff_days") or 0) > 0:
+        c4.metric("期間総差枚", f"{int(summary['total_diff'] or 0):+,}枚")
+    else:
+        c4.metric("期間総差枚", "差枚データなし")
 
     c5, c6 = st.columns(2)
     c5.metric("プラス日", f"{int(summary['plus_days'] or 0)}日")
@@ -2485,10 +2736,13 @@ if menu == "ダッシュボード":
     if not daily.empty:
         daily["date"] = pd.to_datetime(daily["date"])
         st.subheader("日別 総差枚")
-        st.bar_chart(
-            daily.set_index("date")[["total_diff_medals"]],
-            use_container_width=True,
-        )
+        if daily["total_diff_medals"].notna().any():
+            st.bar_chart(
+                daily.set_index("date")[["total_diff_medals"]],
+                use_container_width=True,
+            )
+        else:
+            st.info("この店舗のJSONには差枚列がないため、総差枚グラフは表示しません。")
         daily_display = daily.sort_values("date", ascending=False).rename(
             columns={
                 "date": "日付",
@@ -2538,8 +2792,12 @@ elif menu == "初期DB取込":
 elif menu == "JSON追加":
     st.subheader("アナスロJSON追加")
     st.write(
-        "「アナスロ保存」で取得したJSONを複数まとめて登録できます。"
-        "日付 × 店舗 × 台番号で更新するため、同じ日を再登録しても二重計上しません。"
+        "「アナスロ保存」で取得したJSONを複数店舗まとめて登録できます。"
+        "ページタイトルから店舗名を自動判定し、日付 × 店舗 × 台番号で完全に分けて保存します。"
+    )
+    st.caption(
+        "店舗によって列順や項目が違っても、列名で自動判定します。"
+        "差枚列がない店舗はBB・RB・ART/AT・合算などだけを保存し、差枚を誤推測しません。"
     )
 
     if not admin_gate():
@@ -2561,10 +2819,13 @@ elif menu == "JSON追加":
                 raw = json.loads(file_bytes.decode("utf-8"))
                 parsed = parse_anaslo_json(raw)
                 sha = hashlib.sha256(file_bytes).hexdigest()
-                ok = (
-                    len(parsed["machine_rows"]) == parsed["machine_count"]
-                    and parsed["calc_sum"] == parsed["total_diff_medals"]
-                )
+                row_count_ok = len(parsed["machine_rows"]) == parsed["machine_count"]
+                if parsed.get("has_diff_data"):
+                    diff_ok = parsed["calc_sum"] == parsed["total_diff_medals"]
+                    check_label = "OK" if row_count_ok and diff_ok else "要確認"
+                else:
+                    check_label = "差枚列なし（安全取込）" if row_count_ok else "要確認"
+
                 previews.append(
                     {
                         "ファイル": f.name,
@@ -2573,7 +2834,8 @@ elif menu == "JSON追加":
                         "台数": len(parsed["machine_rows"]),
                         "総差枚": parsed["total_diff_medals"],
                         "台別合計": parsed["calc_sum"],
-                        "照合": "OK" if ok else "要確認",
+                        "検出列": " / ".join(parsed.get("detected_headers", [])),
+                        "照合": check_label,
                     }
                 )
                 parsed_files.append((parsed, sha))
@@ -2586,6 +2848,7 @@ elif menu == "JSON追加":
                         "台数": "",
                         "総差枚": "",
                         "台別合計": "",
+                        "検出列": "",
                         "照合": f"エラー: {e}",
                     }
                 )
@@ -2636,19 +2899,26 @@ elif menu == "日別集計":
     if df.empty:
         st.info("該当データがありません。")
     else:
-        total = int(df["total_diff_medals"].fillna(0).sum())
-        avg = round(df["total_diff_medals"].fillna(0).mean())
         c1, c2, c3 = st.columns(3)
-        c1.metric("期間総差枚", f"{total:+,}枚")
-        c2.metric("1日平均差枚", f"{avg:+,}枚")
+        if df["total_diff_medals"].notna().any():
+            total = int(df["total_diff_medals"].dropna().sum())
+            avg = round(df["total_diff_medals"].dropna().mean())
+            c1.metric("期間総差枚", f"{total:+,}枚")
+            c2.metric("1日平均差枚", f"{avg:+,}枚")
+        else:
+            c1.metric("期間総差枚", "差枚データなし")
+            c2.metric("1日平均差枚", "差枚データなし")
         c3.metric("対象日数", f"{len(df)}日")
 
         chart_df = df.copy()
         chart_df["date"] = pd.to_datetime(chart_df["date"])
-        st.bar_chart(
-            chart_df.set_index("date")[["total_diff_medals"]],
-            use_container_width=True,
-        )
+        if chart_df["total_diff_medals"].notna().any():
+            st.bar_chart(
+                chart_df.set_index("date")[["total_diff_medals"]],
+                use_container_width=True,
+            )
+        else:
+            st.info("この店舗のJSONには差枚列がないため、差枚グラフは表示しません。")
         df_display = df.rename(
             columns={
                 "date": "日付",
@@ -2685,24 +2955,47 @@ elif menu == "機種別分析":
         SELECT
             machine_name,
             COUNT(*) AS records,
+            COUNT(diff_medals) AS diff_records,
             COUNT(DISTINCT date) AS days,
             COUNT(DISTINCT machine_no) AS machines,
             SUM(diff_medals) AS total_diff_medals,
             ROUND(AVG(diff_medals), 1) AS avg_diff_medals,
             ROUND(AVG(games), 1) AS avg_games,
-            SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END) AS win_count,
+            SUM(COALESCE(bb, 0)) AS bb_total,
+            SUM(COALESCE(rb, 0)) AS rb_total,
+            SUM(COALESCE(art, 0)) AS art_total,
+            ROUND(
+                SUM(COALESCE(games, 0))::numeric
+                / NULLIF(
+                    SUM(COALESCE(bb, 0))
+                    + SUM(COALESCE(rb, 0))
+                    + SUM(COALESCE(art, 0)),
+                    0
+                ),
+                1
+            ) AS combined_rate_period,
+            CASE
+                WHEN COUNT(diff_medals) = 0 THEN NULL
+                ELSE SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
+            END AS win_count,
             ROUND(
                 100.0 * SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
-                / NULLIF(COUNT(*), 0),
+                / NULLIF(COUNT(diff_medals), 0),
                 1
             ) AS win_rate
         FROM slot_machine_results
         WHERE store_id = %s AND date BETWEEN %s AND %s
         GROUP BY machine_name
-        ORDER BY total_diff_medals DESC
+        ORDER BY total_diff_medals DESC NULLS LAST, machine_name
         """,
         (store_id, start_date, end_date),
     )
+
+    if not df.empty and pd.to_numeric(df["diff_records"], errors="coerce").fillna(0).sum() == 0:
+        st.info(
+            "この店舗は差枚列がないため、総差枚・平均差枚・勝率は空欄です。"
+            "G数・BB・RB・ART/AT・合算はそのまま確認できます。"
+        )
 
     st.markdown("#### 機種検索")
 
@@ -2736,15 +3029,24 @@ elif menu == "機種別分析":
             filtered_df["machine_name"].isin(selected_machines)
         ]
 
-    df_display = filtered_df.rename(
+    df_display = filtered_df.copy()
+    df_display["combined_rate_period"] = df_display["combined_rate_period"].apply(
+        lambda x: f"1/{float(x):.1f}" if pd.notna(x) and float(x) > 0 else "-"
+    )
+    df_display = df_display.rename(
         columns={
             "machine_name": "機種名",
             "records": "データ件数",
+            "diff_records": "差枚あり件数",
             "days": "データ日数",
             "machines": "台数",
             "total_diff_medals": "総差枚",
             "avg_diff_medals": "平均差枚",
             "avg_games": "平均G数",
+            "bb_total": "BB",
+            "rb_total": "RB",
+            "art_total": "ART/AT",
+            "combined_rate_period": "合算",
             "win_count": "勝ち回数",
             "win_rate": "勝率(%)",
         }
@@ -2773,6 +3075,7 @@ elif menu == "台番号別分析":
         SELECT
             machine_no,
             COUNT(*) AS days,
+            COUNT(diff_medals) AS diff_days,
             MIN(machine_name) AS machine_name_example,
             SUM(diff_medals) AS total_diff_medals,
             ROUND(AVG(diff_medals), 1) AS avg_diff_medals,
@@ -2780,11 +3083,14 @@ elif menu == "台番号別分析":
 
             SUM(COALESCE(bb, 0)) AS bb_total,
             SUM(COALESCE(rb, 0)) AS rb_total,
+            SUM(COALESCE(art, 0)) AS art_total,
 
             ROUND(
                 SUM(COALESCE(games, 0))::numeric
                 / NULLIF(
-                    SUM(COALESCE(bb, 0)) + SUM(COALESCE(rb, 0)),
+                    SUM(COALESCE(bb, 0))
+                    + SUM(COALESCE(rb, 0))
+                    + SUM(COALESCE(art, 0)),
                     0
                 ),
                 1
@@ -2802,11 +3108,20 @@ elif menu == "台番号別分析":
                 1
             ) AS rb_rate_period,
 
-            SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END) AS win_count,
+            ROUND(
+                SUM(COALESCE(games, 0))::numeric
+                / NULLIF(SUM(COALESCE(art, 0)), 0),
+                1
+            ) AS art_rate_period,
+
+            CASE
+                WHEN COUNT(diff_medals) = 0 THEN NULL
+                ELSE SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
+            END AS win_count,
 
             ROUND(
                 100.0 * SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
-                / NULLIF(COUNT(*), 0),
+                / NULLIF(COUNT(diff_medals), 0),
                 1
             ) AS win_rate
 
@@ -2818,7 +3133,7 @@ elif menu == "台番号別分析":
 
         GROUP BY machine_no
 
-        ORDER BY total_diff_medals DESC
+        ORDER BY total_diff_medals DESC NULLS LAST, machine_no
         """,
         (store_id, start_date, end_date),
     )
@@ -2830,47 +3145,69 @@ elif menu == "台番号別分析":
         max_value=max(1, len(pd.date_range(start_date, end_date))),
         value=1,
     )
-    sort_choice = c2.selectbox(
-        "並び順",
-        ["総差枚が高い順", "平均差枚が高い順", "勝率が高い順", "台番号順"],
-    )
+
+    has_diff_rows = (pd.to_numeric(df.get("diff_days"), errors="coerce").fillna(0) > 0).any()
+    if has_diff_rows:
+        sort_options = [
+            "総差枚が高い順",
+            "平均差枚が高い順",
+            "勝率が高い順",
+            "平均G数が高い順",
+            "合算が良い順",
+            "台番号順",
+        ]
+    else:
+        sort_options = ["平均G数が高い順", "合算が良い順", "台番号順"]
+        st.info(
+            "この店舗は差枚列がないため、差枚・勝率の並び替えは表示していません。"
+            "BB・RB・ART/AT・合算は確認できます。"
+        )
+
+    sort_choice = c2.selectbox("並び順", sort_options)
 
     df = df[df["days"] >= min_days]
 
     if sort_choice == "総差枚が高い順":
-        df = df.sort_values("total_diff_medals", ascending=False)
+        df = df.sort_values("total_diff_medals", ascending=False, na_position="last")
     elif sort_choice == "平均差枚が高い順":
-        df = df.sort_values("avg_diff_medals", ascending=False)
+        df = df.sort_values("avg_diff_medals", ascending=False, na_position="last")
     elif sort_choice == "勝率が高い順":
-        df = df.sort_values("win_rate", ascending=False)
+        df = df.sort_values("win_rate", ascending=False, na_position="last")
+    elif sort_choice == "平均G数が高い順":
+        df = df.sort_values("avg_games", ascending=False, na_position="last")
+    elif sort_choice == "合算が良い順":
+        df = df.sort_values("combined_rate_period", ascending=True, na_position="last")
     else:
         df = df.sort_values("machine_no")
 
     df_display = df.copy()
 
-    df_display["combined_rate_period"] = df_display["combined_rate_period"].apply(
-        lambda x: f"1/{float(x):.1f}" if pd.notna(x) else "-"
-    )
-    df_display["bb_rate_period"] = df_display["bb_rate_period"].apply(
-        lambda x: f"1/{float(x):.1f}" if pd.notna(x) else "-"
-    )
-    df_display["rb_rate_period"] = df_display["rb_rate_period"].apply(
-        lambda x: f"1/{float(x):.1f}" if pd.notna(x) else "-"
-    )
+    for col in [
+        "combined_rate_period",
+        "bb_rate_period",
+        "rb_rate_period",
+        "art_rate_period",
+    ]:
+        df_display[col] = df_display[col].apply(
+            lambda x: f"1/{float(x):.1f}" if pd.notna(x) and float(x) > 0 else "-"
+        )
 
     df_display = df_display.rename(
         columns={
             "machine_no": "台番号",
             "days": "データ日数",
+            "diff_days": "差枚あり日数",
             "machine_name_example": "機種名",
             "total_diff_medals": "総差枚",
             "avg_diff_medals": "平均差枚",
             "avg_games": "平均G数",
             "bb_total": "BB",
             "rb_total": "RB",
+            "art_total": "ART/AT",
             "combined_rate_period": "合算",
             "bb_rate_period": "BB確率",
             "rb_rate_period": "RB確率",
+            "art_rate_period": "ART/AT確率",
             "win_count": "勝ち回数",
             "win_rate": "勝率(%)",
         }
@@ -2883,53 +3220,83 @@ elif menu == "台番号別分析":
     )
 
 
-elif menu == "特定日・仕掛け実績":
-    st.subheader("📅 特定日・仕掛け実績")
+elif menu == "店舗別イベント管理":
+    st.subheader("🏬 店舗別イベント管理")
     st.write(
-        "ユーザー提供の「仕掛け一覧」画像4枚から判読できた"
-        "特定日・イベント名を保存しています。"
+        "イベントは店舗ごとに完全分離して保存します。"
+        "今日のイベントだけでなく、過去の日付も後から何件でも登録できます。"
     )
     st.caption(
-        "画像の細かい機種欄・その他仕掛けは、誤読を避けるため自動登録していません。"
-        "同じイベント日の台別実績は、登録済みアナスロデータから計算します。"
+        "同じ店舗・同じ日に複数イベントが重なっていても別々に登録できます。"
+        "新橋のイベントが三田など別店舗の分析へ混ざることはありません。"
     )
+
+    is_admin = admin_gate()
+
+    if is_admin:
+        with st.expander("➕ まだ台データがない店舗を先に追加"):
+            new_store_name = st.text_input(
+                "新しい店舗名",
+                placeholder="例：ピーアーク三田",
+                key="event_new_store_name",
+            )
+            if st.button("店舗を追加", key="event_add_store"):
+                try:
+                    create_store_by_name(new_store_name)
+                    st.success(f"店舗「{new_store_name.strip()}」を追加しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
 
     store_id, store_name = store_selector()
     if store_id is None:
-        st.info("店舗データがありません。")
+        st.info("店舗がありません。JSONを登録するか、上の『店舗を追加』から作成してください。")
         st.stop()
+
+    st.success(f"現在の店舗：{store_name}")
 
     events = query_df(
         """
         SELECT
+            e.event_id,
             e.date,
             e.event_name,
             e.event_tags,
+            e.full_machine_names,
+            e.half_machine_names,
+            e.tail_targets,
+            e.line_targets,
+            e.other_features,
             e.source_label,
             e.confidence,
             e.note,
             d.total_diff_medals,
             d.avg_games,
             d.win_rate
-        FROM slot_special_events e
+        FROM slot_store_events e
         LEFT JOIN slot_daily_store_summary d
           ON d.store_id = e.store_id
          AND d.date = e.date
         WHERE e.store_id = %s
-        ORDER BY e.date DESC
+        ORDER BY e.date DESC, e.event_id DESC
         """,
         (store_id,),
     )
 
+    st.markdown("#### 登録済みイベント履歴")
     if events.empty:
-        st.info("特定日データはまだありません。")
+        st.info("この店舗のイベントはまだ登録されていません。")
     else:
-        display = events.copy()
-        display = display.rename(
+        display = events.copy().rename(
             columns={
                 "date": "日付",
                 "event_name": "イベント名",
                 "event_tags": "分析タグ",
+                "full_machine_names": "全台系機種",
+                "half_machine_names": "1/2系機種",
+                "tail_targets": "末尾",
+                "line_targets": "並び",
+                "other_features": "その他仕掛け",
                 "total_diff_medals": "実データ総差枚",
                 "avg_games": "実データ平均G数",
                 "win_rate": "実データ勝率(%)",
@@ -2944,6 +3311,11 @@ elif menu == "特定日・仕掛け実績":
                     "日付",
                     "イベント名",
                     "分析タグ",
+                    "全台系機種",
+                    "1/2系機種",
+                    "末尾",
+                    "並び",
+                    "その他仕掛け",
                     "実データ総差枚",
                     "実データ平均G数",
                     "実データ勝率(%)",
@@ -2956,23 +3328,17 @@ elif menu == "特定日・仕掛け実績":
             hide_index=True,
         )
 
-        st.markdown("#### イベント別の店全体実績")
-        stats_source = events.dropna(
-            subset=["total_diff_medals"]
-        ).copy()
-
+        st.markdown("#### イベント名ごとの店全体実績")
+        stats_source = events.dropna(subset=["total_diff_medals"]).copy()
         if stats_source.empty:
-            st.info("台別DBと重なる日がまだありません。")
+            st.info("この店舗はイベント日と差枚データがまだ重なっていません。")
         else:
             stats = (
                 stats_source.groupby("event_name")
                 .agg(
                     開催回数=("date", "nunique"),
                     平均総差枚=("total_diff_medals", "mean"),
-                    プラス回数=(
-                        "total_diff_medals",
-                        lambda s: (s > 0).sum(),
-                    ),
+                    プラス回数=("total_diff_medals", lambda s: (s > 0).sum()),
                     平均勝率=("win_rate", "mean"),
                 )
                 .reset_index()
@@ -2985,107 +3351,204 @@ elif menu == "特定日・仕掛け実績":
             ).round(1)
             stats["平均総差枚"] = stats["平均総差枚"].round(0)
             stats["平均勝率"] = stats["平均勝率"].round(1)
-
             st.dataframe(
                 stats[
-                    [
-                        "イベント名",
-                        "開催回数",
-                        "平均総差枚",
-                        "プラス率(%)",
-                        "平均勝率",
-                    ]
-                ].sort_values(
-                    ["開催回数", "平均総差枚"],
-                    ascending=[False, False],
-                ),
+                    ["イベント名", "開催回数", "平均総差枚", "プラス率(%)", "平均勝率"]
+                ].sort_values(["開催回数", "平均総差枚"], ascending=[False, False]),
                 use_container_width=True,
                 hide_index=True,
             )
 
-    st.markdown("---")
-    st.markdown("#### 特定日を追加・修正")
+    if is_admin:
+        st.markdown("---")
+        st.markdown("#### ➕ 新しいイベントを登録（過去日も可）")
+        with st.form("new_store_event_form", clear_on_submit=True):
+            event_date = st.date_input(
+                "日付",
+                value=datetime.now().date(),
+                key="new_event_date",
+            )
+            event_name = st.text_input(
+                "イベント名",
+                placeholder="例：7の付く日、スロパチ、THANK YOU",
+                key="new_event_name",
+            )
+            event_tags = st.text_input(
+                "分析タグ（複数はカンマ区切り）",
+                placeholder="例：7の付く日,ぶちアゲWeek",
+                key="new_event_tags",
+            )
 
-    if admin_gate():
-        existing_dates = {}
+            c1, c2 = st.columns(2)
+            full_machine_names = c1.text_area(
+                "全台系機種",
+                placeholder="分かる範囲で。複数は改行またはカンマ区切り",
+                key="new_event_full",
+            )
+            half_machine_names = c2.text_area(
+                "1/2系・半台系機種",
+                placeholder="分かる範囲で入力",
+                key="new_event_half",
+            )
+
+            c3, c4 = st.columns(2)
+            tail_targets = c3.text_input(
+                "末尾",
+                placeholder="例：7、末尾99 など",
+                key="new_event_tail",
+            )
+            line_targets = c4.text_input(
+                "並び",
+                placeholder="例：3台並び、4台並び複数",
+                key="new_event_line",
+            )
+
+            other_features = st.text_area(
+                "その他仕掛け",
+                placeholder="角、塊、1/3、列など分かる内容",
+                key="new_event_other",
+            )
+
+            c5, c6 = st.columns(2)
+            source_label = c5.text_input(
+                "情報元",
+                value="手入力",
+                key="new_event_source",
+            )
+            confidence = c6.selectbox(
+                "確度",
+                ["確定", "画像から判読", "手入力", "要確認"],
+                index=2,
+                key="new_event_confidence",
+            )
+            note = st.text_area("メモ", key="new_event_note")
+
+            submitted = st.form_submit_button("このイベントを保存", type="primary")
+            if submitted:
+                try:
+                    save_store_event(
+                        store_id=store_id,
+                        event_date=event_date,
+                        event_name=event_name,
+                        event_tags=event_tags or event_name,
+                        full_machine_names=full_machine_names,
+                        half_machine_names=half_machine_names,
+                        tail_targets=tail_targets,
+                        line_targets=line_targets,
+                        other_features=other_features,
+                        source_label=source_label,
+                        confidence=confidence,
+                        note=note,
+                    )
+                    st.success("イベントを保存しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存できませんでした: {e}")
+
         if not events.empty:
-            for _, row in events.iterrows():
-                existing_dates[
-                    pd.Timestamp(row["date"]).date()
-                ] = row
+            st.markdown("---")
+            st.markdown("#### ✏️ 登録済みイベントを修正・削除")
 
-        event_date = st.date_input(
-            "日付",
-            value=datetime.now().date(),
-            key="special_event_date",
-        )
+            event_options = events[["event_id", "date", "event_name"]].copy()
+            event_options["label"] = event_options.apply(
+                lambda r: f"{r['date']} ｜ {r['event_name']}", axis=1
+            )
+            label_to_id = dict(zip(event_options["label"], event_options["event_id"]))
+            selected_label = st.selectbox(
+                "修正するイベント",
+                event_options["label"].tolist(),
+                key="edit_event_selector",
+            )
+            selected_event_id = int(label_to_id[selected_label])
+            current = events.loc[events["event_id"] == selected_event_id].iloc[0]
 
-        current_row = existing_dates.get(event_date)
+            edit_date = st.date_input(
+                "日付（修正）",
+                value=pd.Timestamp(current["date"]).date(),
+                key=f"edit_event_date_{selected_event_id}",
+            )
+            edit_name = st.text_input(
+                "イベント名（修正）",
+                value=text_or_blank(current["event_name"]),
+                key=f"edit_event_name_{selected_event_id}",
+            )
+            edit_tags = st.text_input(
+                "分析タグ（修正）",
+                value=text_or_blank(current["event_tags"]),
+                key=f"edit_event_tags_{selected_event_id}",
+            )
 
-        event_name = st.text_input(
-            "イベント名",
-            value=(
-                str(current_row["event_name"])
-                if current_row is not None
-                else ""
-            ),
-            key=f"special_event_name_{event_date}",
-        )
+            e1, e2 = st.columns(2)
+            edit_full = e1.text_area(
+                "全台系機種（修正）",
+                value=text_or_blank(current["full_machine_names"]),
+                key=f"edit_event_full_{selected_event_id}",
+            )
+            edit_half = e2.text_area(
+                "1/2系・半台系機種（修正）",
+                value=text_or_blank(current["half_machine_names"]),
+                key=f"edit_event_half_{selected_event_id}",
+            )
 
-        event_tags = st.text_input(
-            "分析タグ（複数はカンマ区切り）",
-            value=(
-                str(current_row["event_tags"] or "")
-                if current_row is not None
-                else ""
-            ),
-            placeholder="例：7の付く日,ぶちアゲWeek",
-            key=f"special_event_tags_{event_date}",
-        )
+            e3, e4 = st.columns(2)
+            edit_tail = e3.text_input(
+                "末尾（修正）",
+                value=text_or_blank(current["tail_targets"]),
+                key=f"edit_event_tail_{selected_event_id}",
+            )
+            edit_line = e4.text_input(
+                "並び（修正）",
+                value=text_or_blank(current["line_targets"]),
+                key=f"edit_event_line_{selected_event_id}",
+            )
+            edit_other = st.text_area(
+                "その他仕掛け（修正）",
+                value=text_or_blank(current["other_features"]),
+                key=f"edit_event_other_{selected_event_id}",
+            )
+            edit_source = st.text_input(
+                "情報元（修正）",
+                value=text_or_blank(current["source_label"]),
+                key=f"edit_event_source_{selected_event_id}",
+            )
+            edit_confidence = st.text_input(
+                "確度（修正）",
+                value=text_or_blank(current["confidence"]),
+                key=f"edit_event_confidence_{selected_event_id}",
+            )
+            edit_note = st.text_area(
+                "メモ（修正）",
+                value=text_or_blank(current["note"]),
+                key=f"edit_event_note_{selected_event_id}",
+            )
 
-        note = st.text_area(
-            "メモ",
-            value=(
-                str(current_row["note"] or "")
-                if current_row is not None
-                else ""
-            ),
-            key=f"special_event_note_{event_date}",
-        )
+            b1, b2 = st.columns(2)
+            if b1.button("変更を保存", type="primary", key="update_store_event"):
+                try:
+                    save_store_event(
+                        store_id=store_id,
+                        event_id=selected_event_id,
+                        event_date=edit_date,
+                        event_name=edit_name,
+                        event_tags=edit_tags or edit_name,
+                        full_machine_names=edit_full,
+                        half_machine_names=edit_half,
+                        tail_targets=edit_tail,
+                        line_targets=edit_line,
+                        other_features=edit_other,
+                        source_label=edit_source,
+                        confidence=edit_confidence,
+                        note=edit_note,
+                    )
+                    st.success("変更を保存しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"変更できませんでした: {e}")
 
-        c1, c2 = st.columns(2)
-
-        if c1.button(
-            "この内容で保存",
-            type="primary",
-            key="save_special_event",
-        ):
-            if not event_name.strip():
-                st.error("イベント名を入力してください。")
-            else:
-                upsert_special_event(
-                    store_id,
-                    event_date,
-                    event_name,
-                    event_tags or event_name,
-                    note=note,
-                )
-                st.success("特定日・イベント情報を保存しました。")
+            if b2.button("このイベントを削除", key="delete_store_event_button"):
+                delete_store_event(store_id, selected_event_id)
+                st.success("イベントを削除しました。")
                 st.rerun()
-
-        if (
-            current_row is not None
-            and c2.button(
-                "この日を削除",
-                key="delete_special_event",
-            )
-        ):
-            delete_special_event(
-                store_id,
-                event_date,
-            )
-            st.success("削除しました。")
-            st.rerun()
 
 
 elif menu == "狙い分析":
@@ -3116,9 +3579,11 @@ elif menu == "狙い分析":
             diff_medals,
             bb,
             rb,
+            art,
             combined_rate,
             bb_rate,
-            rb_rate
+            rb_rate,
+            art_rate
         FROM slot_machine_results
         WHERE store_id = %s
         ORDER BY date, machine_no
@@ -3128,6 +3593,18 @@ elif menu == "狙い分析":
 
     if analysis_data.empty:
         st.info("台別データがありません。")
+        st.stop()
+
+    diff_available_rows = pd.to_numeric(
+        analysis_data["diff_medals"], errors="coerce"
+    ).notna().sum()
+    if diff_available_rows == 0:
+        st.warning(
+            "この店舗のアナスロJSONには差枚列がありません。"
+            "BB・RB・ART/AT・合算などは保存されていますが、"
+            "全台系・末尾・凹み・並びなど差枚を使う狙い分析は誤判定防止のため実行しません。"
+        )
+        st.info("台番号別分析ではBB・RBなどの実績を確認できます。")
         st.stop()
 
     analysis_data["date"] = pd.to_datetime(
@@ -3159,7 +3636,7 @@ elif menu == "狙い分析":
             source_label,
             confidence,
             note
-        FROM slot_special_events
+        FROM slot_store_events
         WHERE store_id = %s
         ORDER BY date
         """,
@@ -3177,9 +3654,10 @@ elif menu == "狙い分析":
             == target_date
         ]
         if not exact_target.empty:
-            default_event_tags = split_event_tags(
-                exact_target.iloc[0]["event_tags"]
-            )
+            tag_set = set()
+            for value in exact_target["event_tags"].fillna(""):
+                tag_set.update(split_event_tags(value))
+            default_event_tags = sorted(tag_set, key=kana_sort_key)
 
     selected_event_tags = st.multiselect(
         "今回の特定日・イベント（複数選択可）",
