@@ -1653,6 +1653,218 @@ def save_juggler_master(machine_name, source_label, source_url, note, aliases, s
     return spec_id
 
 
+
+# 北電子公式サイトの確率表をもとにした初期ジャグラーマスタ。
+# 2026-09-14確認。DB上の表記揺れは aliases で公式機種名へ紐づける。
+JUGGLER_OFFICIAL_SEEDS = [
+    {
+        "machine_name": "ウルトラミラクルジャグラー",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/ultramiraclejuggler/",
+        "note": "北電子公式確率表。2026-09-14確認。",
+        "aliases": [],
+        "settings": [
+            (1, 267.5, 425.6, 164.3),
+            (2, 261.1, 402.1, 158.3),
+            (3, 256.0, 350.5, 147.9),
+            (4, 242.7, 322.8, 138.6),
+            (5, 233.2, 297.9, 130.8),
+            (6, 216.3, 277.7, 121.6),
+        ],
+    },
+    {
+        "machine_name": "ゴーゴージャグラー3",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/gogojuggler3/",
+        "note": "北電子公式確率表。2026-09-14確認。",
+        "aliases": ["GOGOジャグラー3"],
+        "settings": [
+            (1, 259.0, 354.2, 149.6),
+            (2, 258.0, 332.7, 145.3),
+            (3, 257.0, 306.2, 139.7),
+            (4, 254.0, 268.6, 130.5),
+            (5, 247.3, 247.3, 123.7),
+            (6, 234.9, 234.9, 117.4),
+        ],
+    },
+    {
+        "machine_name": "ジャグラーガールズSS",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/jugglergirlsss/",
+        "note": "北電子公式確率表。アナスロ表記『ジャグラーガールズ』を別名登録。2026-09-14確認。",
+        "aliases": ["ジャグラーガールズ"],
+        "settings": [
+            (1, 273.1, 381.0, 159.1),
+            (2, 270.8, 350.5, 152.8),
+            (3, 260.1, 316.6, 142.8),
+            (4, 250.1, 281.3, 132.4),
+            (5, 243.6, 270.8, 128.3),
+            (6, 226.0, 252.1, 119.2),
+        ],
+    },
+    {
+        "machine_name": "ネオアイムジャグラーEX",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/neoimjugglerex/",
+        "note": "北電子公式確率表。2026-09-14確認。",
+        "aliases": [],
+        "settings": [
+            (1, 273.1, 439.8, 168.5),
+            (2, 269.7, 399.6, 161.0),
+            (3, 269.7, 331.0, 148.6),
+            (4, 259.0, 315.1, 142.2),
+            (5, 259.0, 255.0, 128.5),
+            (6, 255.0, 255.0, 127.5),
+        ],
+    },
+    {
+        "machine_name": "ハッピージャグラーV Ⅲ",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/happyjugglerv3/",
+        "note": "北電子公式確率表。アナスロ表記『ハッピージャグラーVIII』等を別名登録。2026-09-14確認。",
+        "aliases": [
+            "ハッピージャグラーVIII",
+            "ハッピージャグラーV III",
+            "ハッピージャグラーV3",
+        ],
+        "settings": [
+            (1, 273.1, 397.2, 161.8),
+            (2, 270.8, 362.1, 154.9),
+            (3, 263.2, 332.7, 146.9),
+            (4, 254.0, 300.6, 137.7),
+            (5, 239.2, 273.1, 127.5),
+            (6, 226.0, 256.0, 120.0),
+        ],
+    },
+    {
+        "machine_name": "ファンキージャグラー2",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/funkyjuggler2/",
+        "note": "北電子公式確率表。2026-09-14確認。",
+        "aliases": ["ファンキージャグラーⅡ"],
+        "settings": [
+            (1, 266.4, 439.8, 165.9),
+            (2, 259.0, 407.1, 158.3),
+            (3, 256.0, 366.1, 150.7),
+            (4, 249.2, 322.8, 140.6),
+            (5, 240.1, 299.3, 133.2),
+            (6, 219.9, 262.1, 119.6),
+        ],
+    },
+    {
+        "machine_name": "マイジャグラーⅤ",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/myjuggler5/",
+        "note": "北電子公式確率表。アナスロ表記『マイジャグラーV』を別名登録。2026-09-14確認。",
+        "aliases": ["マイジャグラーV", "マイジャグラー5"],
+        "settings": [
+            (1, 273.1, 409.6, 163.8),
+            (2, 270.8, 385.5, 159.1),
+            (3, 266.4, 336.1, 148.6),
+            (4, 254.0, 290.0, 135.4),
+            (5, 240.1, 268.6, 126.8),
+            (6, 229.1, 229.1, 114.6),
+        ],
+    },
+    {
+        "machine_name": "ミスタージャグラー",
+        "source_label": "北電子公式",
+        "source_url": "https://www.kitadenshi.co.jp/slot/mrjuggler/",
+        "note": "北電子公式確率表。2026-09-14確認。",
+        "aliases": [],
+        "settings": [
+            (1, 268.6, 374.5, 156.4),
+            (2, 267.5, 354.2, 152.4),
+            (3, 260.1, 331.0, 145.6),
+            (4, 249.2, 291.3, 134.3),
+            (5, 240.9, 257.0, 124.4),
+            (6, 237.4, 237.4, 118.7),
+        ],
+    },
+]
+
+
+def seed_juggler_official_defaults():
+    """
+    現在DBで検出済みの主要ジャグラー8機種を北電子公式値で初期登録する。
+    migration_keyで1回だけ実行し、その後の手動修正は上書きしない。
+    """
+    migration_key = "juggler_official_specs_20260914_v1"
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM slot_schema_migrations WHERE migration_key = %s",
+                (migration_key,),
+            )
+            if cur.fetchone():
+                return
+
+            for seed in JUGGLER_OFFICIAL_SEEDS:
+                cur.execute(
+                    """
+                    INSERT INTO slot_juggler_masters
+                        (machine_name, source_label, source_url, note, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT(machine_name) DO UPDATE SET
+                        source_label = EXCLUDED.source_label,
+                        source_url = EXCLUDED.source_url,
+                        note = EXCLUDED.note,
+                        updated_at = NOW()
+                    RETURNING spec_id
+                    """,
+                    (
+                        seed["machine_name"],
+                        seed["source_label"],
+                        seed["source_url"],
+                        seed["note"],
+                    ),
+                )
+                spec_id = int(cur.fetchone()[0])
+
+                cur.execute(
+                    "DELETE FROM slot_juggler_spec_values WHERE spec_id = %s",
+                    (spec_id,),
+                )
+                for setting, bb_den, rb_den, combined_den in seed["settings"]:
+                    cur.execute(
+                        """
+                        INSERT INTO slot_juggler_spec_values
+                            (spec_id, setting, bb_den, rb_den, combined_den)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (spec_id, setting, bb_den, rb_den, combined_den),
+                    )
+
+                cur.execute(
+                    "DELETE FROM slot_juggler_aliases WHERE spec_id = %s",
+                    (spec_id,),
+                )
+                for alias in seed["aliases"]:
+                    cur.execute(
+                        """
+                        INSERT INTO slot_juggler_aliases(alias_name, spec_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT(alias_name) DO UPDATE SET
+                            spec_id = EXCLUDED.spec_id
+                        """,
+                        (alias, spec_id),
+                    )
+
+            cur.execute(
+                """
+                INSERT INTO slot_schema_migrations(migration_key)
+                VALUES (%s)
+                ON CONFLICT(migration_key) DO NOTHING
+                """,
+                (migration_key,),
+            )
+
+        conn.commit()
+
+    clear_cache()
+
+
 def juggler_master_status_df():
     detected = get_detected_juggler_names()
     name_map, _ = load_juggler_spec_map()
@@ -3307,6 +3519,7 @@ def run_strategy_backtest(
 
 init_db()
 seed_special_event_defaults()
+seed_juggler_official_defaults()
 
 st.title("🎰 スロ屋データベース")
 
@@ -4228,6 +4441,9 @@ elif menu == "ジャグラー公式スペック管理":
     st.write(
         "ジャグラーの設定1～6について、公式BB確率・RB確率・合算を登録します。"
         "一度登録すれば全店舗で共通利用できます。新台もここへ1回追加するだけで対応できます。"
+    )
+    st.success(
+        "現在DBで検出している主要8機種は、北電子公式サイトの設定1～6（BB・RB・合算）を初期登録済みです。"
     )
     st.info(
         "新台対応：JSONで新しいジャグラー名を検出 → 未登録表示 → 設定1～6の公式値を登録 → "
