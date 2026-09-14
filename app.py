@@ -1205,10 +1205,22 @@ def juggler_setting_fit(games, bb, rb, spec):
         data_confidence = "かなり低い"
         game_factor = 0.20
 
-    if games < 1000 or best_fit < 30:
-        judgement = "判別困難"
+    # 実戦向けの5段階表示
+    # ※設定確定ではなく、BB/RB実績と公式確率の相対適合度による目安。
+    fit_46 = fits[4] + fits[5] + fits[6]
+    fit_24 = fits[2] + fits[3] + fits[4]
+    fit_12 = fits[1] + fits[2]
+
+    if games < 2000:
+        judgement = "サンプル不足"
+    elif high_fit >= 45:
+        judgement = "設定5～6有力"
+    elif fit_46 >= 55:
+        judgement = "設定4～6候補"
+    elif fit_12 >= 55:
+        judgement = "低設定寄り"
     else:
-        judgement = f"設定{best_setting}寄り"
+        judgement = "設定2～4候補"
 
     total_bonus = bb + rb
     actual_combined = (games / total_bonus) if total_bonus > 0 else None
@@ -1218,6 +1230,9 @@ def juggler_setting_fit(games, bb, rb, spec):
         "best_setting": best_setting,
         "best_fit": best_fit,
         "high_fit": high_fit,
+        "fit_46": fit_46,
+        "fit_24": fit_24,
+        "fit_12": fit_12,
         "setting6_fit": fits[6],
         "data_confidence": data_confidence,
         "judgement": judgement,
