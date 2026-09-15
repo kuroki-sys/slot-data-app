@@ -338,7 +338,7 @@ def seed_special_event_defaults():
 
 
 def create_store_by_name(store_name):
-    name = str(store_name or "").strip()
+    name = canonicalize_store_name(store_name)
     if not name:
         raise ValueError("店舗名を入力してください。")
     with get_conn() as conn:
@@ -489,7 +489,206 @@ def clear_cache():
     st.cache_data.clear()
 
 
+
+def canonicalize_store_name(store_name):
+    """
+    アナスロのページタイトルにイベント文言が付いた場合でも、
+    同じ実店舗は同じ店舗として扱う。
+    例: 「ピーアーク三田 周年」→「ピーアーク三田」
+    """
+    name = re.sub(r"[\s　]+", " ", str(store_name or "")).strip()
+
+    # 店舗名の末尾に付く「周年」「周年日」「○周年」は店舗名から外す。
+    name = re.sub(
+        r"\s+(?:[0-9０-９]+\s*周年|周年日?|周年)$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    return name
+
+
+def merge_store_name_aliases():
+    """
+    すでにDBへ別店舗として入ってしまった
+    「○○ 周年」などを正式店舗名へ自動統合する。
+    台データ・日別集計・イベント履歴も正式店舗へ移す。
+    """
+    changed = False
+
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT store_id, store_name FROM slot_stores ORDER BY store_id"
+            )
+            stores = cur.fetchall()
+
+            for row in stores:
+                old_id = int(row["store_id"])
+                old_name = str(row["store_name"])
+                canonical_name = canonicalize_store_name(old_name)
+
+                if not canonical_name or canonical_name == old_name:
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO slot_stores(store_name)
+                    VALUES (%s)
+                    ON CONFLICT(store_name) DO UPDATE
+                    SET store_name = EXCLUDED.store_name
+                    RETURNING store_id
+                    """,
+                    (canonical_name,),
+                )
+                new_id = int(cur.fetchone()[0])
+
+                if new_id == old_id:
+                    continue
+
+                # 日別集計を統合
+                cur.execute(
+                    """
+                    INSERT INTO slot_daily_store_summary (
+                        date, store_id, weekday, total_diff_medals,
+                        avg_diff_medals, avg_games, win_rate,
+                        win_count, machine_count, source_url
+                    )
+                    SELECT
+                        date, %s, weekday, total_diff_medals,
+                        avg_diff_medals, avg_games, win_rate,
+                        win_count, machine_count, source_url
+                    FROM slot_daily_store_summary
+                    WHERE store_id = %s
+                    ON CONFLICT (date, store_id) DO UPDATE SET
+                        weekday = COALESCE(EXCLUDED.weekday, slot_daily_store_summary.weekday),
+                        total_diff_medals = COALESCE(EXCLUDED.total_diff_medals, slot_daily_store_summary.total_diff_medals),
+                        avg_diff_medals = COALESCE(EXCLUDED.avg_diff_medals, slot_daily_store_summary.avg_diff_medals),
+                        avg_games = COALESCE(EXCLUDED.avg_games, slot_daily_store_summary.avg_games),
+                        win_rate = COALESCE(EXCLUDED.win_rate, slot_daily_store_summary.win_rate),
+                        win_count = COALESCE(EXCLUDED.win_count, slot_daily_store_summary.win_count),
+                        machine_count = COALESCE(EXCLUDED.machine_count, slot_daily_store_summary.machine_count),
+                        source_url = COALESCE(EXCLUDED.source_url, slot_daily_store_summary.source_url)
+                    """,
+                    (new_id, old_id),
+                )
+
+                # 台別データを統合
+                cur.execute(
+                    """
+                    INSERT INTO slot_machine_results (
+                        date, store_id, machine_no, machine_name,
+                        games, diff_medals, bb, rb, art,
+                        combined_rate, bb_rate, rb_rate, art_rate,
+                        combined_rate_text, bb_rate_text, rb_rate_text,
+                        art_rate_text, source_url
+                    )
+                    SELECT
+                        date, %s, machine_no, machine_name,
+                        games, diff_medals, bb, rb, art,
+                        combined_rate, bb_rate, rb_rate, art_rate,
+                        combined_rate_text, bb_rate_text, rb_rate_text,
+                        art_rate_text, source_url
+                    FROM slot_machine_results
+                    WHERE store_id = %s
+                    ON CONFLICT (date, store_id, machine_no) DO UPDATE SET
+                        machine_name = COALESCE(EXCLUDED.machine_name, slot_machine_results.machine_name),
+                        games = COALESCE(EXCLUDED.games, slot_machine_results.games),
+                        diff_medals = COALESCE(EXCLUDED.diff_medals, slot_machine_results.diff_medals),
+                        bb = COALESCE(EXCLUDED.bb, slot_machine_results.bb),
+                        rb = COALESCE(EXCLUDED.rb, slot_machine_results.rb),
+                        art = COALESCE(EXCLUDED.art, slot_machine_results.art),
+                        combined_rate = COALESCE(EXCLUDED.combined_rate, slot_machine_results.combined_rate),
+                        bb_rate = COALESCE(EXCLUDED.bb_rate, slot_machine_results.bb_rate),
+                        rb_rate = COALESCE(EXCLUDED.rb_rate, slot_machine_results.rb_rate),
+                        art_rate = COALESCE(EXCLUDED.art_rate, slot_machine_results.art_rate),
+                        combined_rate_text = COALESCE(EXCLUDED.combined_rate_text, slot_machine_results.combined_rate_text),
+                        bb_rate_text = COALESCE(EXCLUDED.bb_rate_text, slot_machine_results.bb_rate_text),
+                        rb_rate_text = COALESCE(EXCLUDED.rb_rate_text, slot_machine_results.rb_rate_text),
+                        art_rate_text = COALESCE(EXCLUDED.art_rate_text, slot_machine_results.art_rate_text),
+                        source_url = COALESCE(EXCLUDED.source_url, slot_machine_results.source_url)
+                    """,
+                    (new_id, old_id),
+                )
+
+                # 旧イベントテーブル
+                cur.execute(
+                    """
+                    INSERT INTO slot_special_events (
+                        date, store_id, event_name, event_tags,
+                        source_label, confidence, note
+                    )
+                    SELECT
+                        date, %s, event_name, event_tags,
+                        source_label, confidence, note
+                    FROM slot_special_events
+                    WHERE store_id = %s
+                    ON CONFLICT (date, store_id) DO NOTHING
+                    """,
+                    (new_id, old_id),
+                )
+
+                # 現行イベント履歴はイベント名単位で全部残す
+                cur.execute(
+                    """
+                    INSERT INTO slot_store_events (
+                        date, store_id, event_name, event_tags,
+                        full_machine_names, half_machine_names,
+                        tail_targets, line_targets, other_features,
+                        source_label, confidence, note,
+                        created_at, updated_at
+                    )
+                    SELECT
+                        date, %s, event_name, event_tags,
+                        full_machine_names, half_machine_names,
+                        tail_targets, line_targets, other_features,
+                        source_label, confidence, note,
+                        created_at, updated_at
+                    FROM slot_store_events
+                    WHERE store_id = %s
+                    ON CONFLICT (store_id, date, event_name) DO UPDATE SET
+                        event_tags = COALESCE(EXCLUDED.event_tags, slot_store_events.event_tags),
+                        full_machine_names = COALESCE(EXCLUDED.full_machine_names, slot_store_events.full_machine_names),
+                        half_machine_names = COALESCE(EXCLUDED.half_machine_names, slot_store_events.half_machine_names),
+                        tail_targets = COALESCE(EXCLUDED.tail_targets, slot_store_events.tail_targets),
+                        line_targets = COALESCE(EXCLUDED.line_targets, slot_store_events.line_targets),
+                        other_features = COALESCE(EXCLUDED.other_features, slot_store_events.other_features),
+                        source_label = COALESCE(EXCLUDED.source_label, slot_store_events.source_label),
+                        confidence = COALESCE(EXCLUDED.confidence, slot_store_events.confidence),
+                        note = COALESCE(EXCLUDED.note, slot_store_events.note),
+                        updated_at = GREATEST(EXCLUDED.updated_at, slot_store_events.updated_at)
+                    """,
+                    (new_id, old_id),
+                )
+
+                # インポート履歴の表示名も正式店舗名へ揃える
+                cur.execute(
+                    """
+                    UPDATE slot_import_log
+                    SET store_name = %s
+                    WHERE store_name = %s
+                    """,
+                    (canonical_name, old_name),
+                )
+
+                # 元店舗の関連データを削除後、重複店舗を削除
+                cur.execute("DELETE FROM slot_store_events WHERE store_id = %s", (old_id,))
+                cur.execute("DELETE FROM slot_special_events WHERE store_id = %s", (old_id,))
+                cur.execute("DELETE FROM slot_machine_results WHERE store_id = %s", (old_id,))
+                cur.execute("DELETE FROM slot_daily_store_summary WHERE store_id = %s", (old_id,))
+                cur.execute("DELETE FROM slot_stores WHERE store_id = %s", (old_id,))
+
+                changed = True
+
+        conn.commit()
+
+    if changed:
+        clear_cache()
+
+
 def get_or_create_store_id(cur, store_name):
+    store_name = canonicalize_store_name(store_name)
     cur.execute(
         """
         INSERT INTO slot_stores(store_name)
@@ -547,7 +746,7 @@ def parse_page_title(raw):
     if not m:
         raise ValueError(f"ページタイトルから日付・店舗名を判定できません: {title}")
     date_str = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    store_name = m.group(4).strip()
+    store_name = canonicalize_store_name(m.group(4).strip())
     return date_str, store_name
 
 
@@ -3533,6 +3732,7 @@ def run_strategy_backtest(
 
 
 init_db()
+merge_store_name_aliases()
 seed_special_event_defaults()
 seed_juggler_official_defaults()
 
