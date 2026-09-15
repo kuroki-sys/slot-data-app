@@ -3,3 +3,4 @@ psycopg[binary]
 pandas
 numpy
 pykakasi
+xlsxwriter
