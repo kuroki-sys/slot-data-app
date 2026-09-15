@@ -6,6 +6,7 @@ import re
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,175 @@ st.set_page_config(
 )
 
 DB_URL = st.secrets["DATABASE_URL"]
+
+
+
+def build_multi_day_excel(df, store_name):
+    """
+    複数日の台別データを、日ごとに分けたExcelとして作成する。
+    ・「全日データ」シート：選択した全日を縦に連結（日付列あり）
+    ・日付ごとの個別シート：1日単位の生データ
+    ・「日別サマリー」シート：日ごとの台数・G数・差枚など
+    """
+    output = BytesIO()
+
+    export_df = df.copy()
+    export_df["date"] = pd.to_datetime(export_df["date"]).dt.date
+
+    def rate_text(row, text_col, numeric_col):
+        txt = row.get(text_col)
+        if pd.notna(txt) and str(txt).strip() not in ("", "None", "nan"):
+            return str(txt)
+        num = row.get(numeric_col)
+        if pd.notna(num):
+            try:
+                num = float(num)
+                if num > 0:
+                    return f"1/{num:.1f}"
+            except Exception:
+                pass
+        return "-"
+
+    display_df = pd.DataFrame({
+        "日付": export_df["date"],
+        "台番号": export_df["machine_no"],
+        "機種名": export_df["machine_name"],
+        "G数": export_df["games"],
+        "差枚": export_df["diff_medals"],
+        "BB": export_df["bb"],
+        "RB": export_df["rb"],
+        "ART/AT": export_df["art"],
+        "合算": export_df.apply(
+            lambda r: rate_text(r, "combined_rate_text", "combined_rate"),
+            axis=1,
+        ),
+        "BB確率": export_df.apply(
+            lambda r: rate_text(r, "bb_rate_text", "bb_rate"),
+            axis=1,
+        ),
+        "RB確率": export_df.apply(
+            lambda r: rate_text(r, "rb_rate_text", "rb_rate"),
+            axis=1,
+        ),
+        "ART/AT確率": export_df.apply(
+            lambda r: rate_text(r, "art_rate_text", "art_rate"),
+            axis=1,
+        ),
+    })
+
+    # 日別サマリー
+    summary_rows = []
+    for target_date, g in export_df.groupby("date", sort=True):
+        games_s = pd.to_numeric(g["games"], errors="coerce")
+        diff_s = pd.to_numeric(g["diff_medals"], errors="coerce")
+        bb_s = pd.to_numeric(g["bb"], errors="coerce").fillna(0)
+        rb_s = pd.to_numeric(g["rb"], errors="coerce").fillna(0)
+        art_s = pd.to_numeric(g["art"], errors="coerce").fillna(0)
+
+        games_total = games_s.fillna(0).sum()
+        bonus_total = bb_s.sum() + rb_s.sum() + art_s.sum()
+
+        summary_rows.append({
+            "日付": target_date,
+            "台数": int(len(g)),
+            "平均G数": round(games_s.mean()) if games_s.notna().any() else None,
+            "総差枚": int(diff_s.sum()) if diff_s.notna().any() else None,
+            "平均差枚": round(diff_s.mean()) if diff_s.notna().any() else None,
+            "BB合計": int(bb_s.sum()),
+            "RB合計": int(rb_s.sum()),
+            "ART/AT合計": int(art_s.sum()),
+            "全体合算": (
+                f"1/{games_total / bonus_total:.1f}"
+                if bonus_total > 0 else "-"
+            ),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    with pd.ExcelWriter(
+        output,
+        engine="xlsxwriter",
+        datetime_format="yyyy-mm-dd",
+        date_format="yyyy-mm-dd",
+    ) as writer:
+        workbook = writer.book
+
+        header_fmt = workbook.add_format({
+            "bold": True,
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+        })
+        center_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+        })
+        text_fmt = workbook.add_format({
+            "border": 1,
+            "valign": "vcenter",
+        })
+        int_fmt = workbook.add_format({
+            "border": 1,
+            "align": "right",
+            "num_format": "#,##0",
+        })
+        signed_fmt = workbook.add_format({
+            "border": 1,
+            "align": "right",
+            "num_format": "+#,##0;-#,##0;0",
+        })
+        date_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "num_format": "yyyy-mm-dd",
+        })
+
+        def format_sheet(ws, data, include_date=True):
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, len(data), len(data.columns) - 1)
+            ws.set_row(0, 22)
+
+            for col_idx, col_name in enumerate(data.columns):
+                ws.write(0, col_idx, col_name, header_fmt)
+
+                if col_name == "日付":
+                    ws.set_column(col_idx, col_idx, 12, date_fmt)
+                elif col_name == "機種名":
+                    ws.set_column(col_idx, col_idx, 34, text_fmt)
+                elif col_name in ("台番号", "G数", "BB", "RB", "ART/AT"):
+                    ws.set_column(col_idx, col_idx, 11, int_fmt)
+                elif col_name == "差枚":
+                    ws.set_column(col_idx, col_idx, 12, signed_fmt)
+                else:
+                    ws.set_column(col_idx, col_idx, 13, center_fmt)
+
+        # 全日データ
+        display_df = display_df.sort_values(["日付", "台番号"])
+        display_df.to_excel(writer, sheet_name="全日データ", index=False)
+        format_sheet(writer.sheets["全日データ"], display_df)
+
+        # 日別サマリー
+        summary_df.to_excel(writer, sheet_name="日別サマリー", index=False)
+        summary_ws = writer.sheets["日別サマリー"]
+        summary_ws.freeze_panes(1, 0)
+        summary_ws.autofilter(0, 0, len(summary_df), len(summary_df.columns) - 1)
+        summary_ws.set_column(0, 0, 12, date_fmt)
+        summary_ws.set_column(1, 8, 14)
+        for col_idx, col_name in enumerate(summary_df.columns):
+            summary_ws.write(0, col_idx, col_name, header_fmt)
+
+        # 1日ごとの個別シート
+        for target_date in sorted(display_df["日付"].dropna().unique()):
+            day_df = display_df[display_df["日付"] == target_date].copy()
+            day_df = day_df.drop(columns=["日付"])
+            sheet_name = pd.Timestamp(target_date).strftime("%Y-%m-%d")
+            day_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            format_sheet(writer.sheets[sheet_name], day_df, include_date=False)
+
+    output.seek(0)
+    return output.getvalue()
+
 
 
 def get_conn():
@@ -4152,159 +4322,562 @@ elif menu == "台番号別分析":
         st.info("データがありません。")
         st.stop()
 
-    date_range = date_range_selector(store_id, "number")
-    if not date_range:
-        st.stop()
-    start_date, end_date = date_range
+    display_mode = st.radio(
+        "表示方法",
+        ["1日単位", "期間集計"],
+        horizontal=True,
+        key="machine_number_display_mode",
+        help="1日単位では、その日の各台データを足し算せずそのまま表示します。期間集計は従来どおり複数日の合計・平均です。",
+    )
 
-    df = query_df(
-        """
-        SELECT
-            machine_no,
-            COUNT(*) AS days,
-            COUNT(diff_medals) AS diff_days,
-            MIN(machine_name) AS machine_name_example,
-            SUM(diff_medals) AS total_diff_medals,
-            ROUND(AVG(diff_medals), 1) AS avg_diff_medals,
-            ROUND(AVG(games), 1) AS avg_games,
+    if display_mode == "1日単位":
+        bounds = query_df(
+            """
+            SELECT MIN(date) AS min_date, MAX(date) AS max_date
+            FROM slot_machine_results
+            WHERE store_id = %s
+            """,
+            (store_id,),
+        )
+        if bounds.empty or pd.isna(bounds.iloc[0]["max_date"]):
+            st.info("データがありません。")
+            st.stop()
 
-            SUM(COALESCE(bb, 0)) AS bb_total,
-            SUM(COALESCE(rb, 0)) AS rb_total,
-            SUM(COALESCE(art, 0)) AS art_total,
+        min_date = pd.Timestamp(bounds.iloc[0]["min_date"]).date()
+        max_date = pd.Timestamp(bounds.iloc[0]["max_date"]).date()
 
-            ROUND(
-                SUM(COALESCE(games, 0))::numeric
-                / NULLIF(
-                    SUM(COALESCE(bb, 0))
-                    + SUM(COALESCE(rb, 0))
-                    + SUM(COALESCE(art, 0)),
-                    0
+        selected_date = st.date_input(
+            "表示する日",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key="machine_number_single_date",
+        )
+
+        df = query_df(
+            """
+            SELECT
+                date,
+                machine_no,
+                machine_name,
+                games,
+                diff_medals,
+                bb,
+                rb,
+                art,
+                combined_rate,
+                bb_rate,
+                rb_rate,
+                art_rate,
+                combined_rate_text,
+                bb_rate_text,
+                rb_rate_text,
+                art_rate_text
+            FROM slot_machine_results
+            WHERE store_id = %s
+              AND date = %s
+            ORDER BY machine_no
+            """,
+            (store_id, selected_date),
+        )
+
+        if df.empty:
+            st.info("この日のデータはありません。")
+            st.stop()
+
+        st.markdown("#### 機種を絞り込み")
+
+        machine_choices = sorted(
+            df["machine_name"].dropna().astype(str).unique().tolist(),
+            key=kana_sort_key,
+        )
+
+        c1, c2 = st.columns(2)
+        machine_search = c1.text_input(
+            "機種名を入力して検索",
+            placeholder="例：モンキー、ジャグラー、北斗",
+            key="machine_number_single_search",
+        )
+        selected_machines = c2.multiselect(
+            "機種を複数選択（カナ順）",
+            options=machine_choices,
+            placeholder="未選択なら全機種",
+            key="machine_number_single_multiselect",
+        )
+
+        filtered = df.copy()
+
+        if machine_search:
+            filtered = filtered[
+                filtered["machine_name"]
+                .astype(str)
+                .str.contains(machine_search, case=False, na=False)
+            ]
+
+        if selected_machines:
+            filtered = filtered[
+                filtered["machine_name"].isin(selected_machines)
+            ]
+
+        if filtered.empty:
+            st.info("条件に一致する台がありません。")
+            st.stop()
+
+        has_diff = filtered["diff_medals"].notna().any()
+
+        if has_diff:
+            sort_options = [
+                "台番号順",
+                "差枚が高い順",
+                "G数が高い順",
+                "合算が良い順",
+            ]
+        else:
+            sort_options = [
+                "台番号順",
+                "G数が高い順",
+                "合算が良い順",
+            ]
+
+        sort_choice = st.selectbox(
+            "並び順",
+            sort_options,
+            key="machine_number_single_sort",
+        )
+
+        if sort_choice == "差枚が高い順":
+            filtered = filtered.sort_values(
+                "diff_medals",
+                ascending=False,
+                na_position="last",
+            )
+        elif sort_choice == "G数が高い順":
+            filtered = filtered.sort_values(
+                "games",
+                ascending=False,
+                na_position="last",
+            )
+        elif sort_choice == "合算が良い順":
+            filtered = filtered.sort_values(
+                "combined_rate",
+                ascending=True,
+                na_position="last",
+            )
+        else:
+            filtered = filtered.sort_values("machine_no")
+
+        def one_day_rate_text(row, text_col, numeric_col):
+            txt = row.get(text_col)
+            if pd.notna(txt) and str(txt).strip() not in ("", "None", "nan"):
+                return str(txt)
+            num = row.get(numeric_col)
+            if pd.notna(num) and float(num) > 0:
+                return f"1/{float(num):.1f}"
+            return "-"
+
+        display = pd.DataFrame({
+            "台番号": filtered["machine_no"],
+            "機種名": filtered["machine_name"],
+            "G数": filtered["games"],
+            "差枚": filtered["diff_medals"],
+            "BB": filtered["bb"],
+            "RB": filtered["rb"],
+            "ART/AT": filtered["art"],
+            "合算": filtered.apply(
+                lambda r: one_day_rate_text(r, "combined_rate_text", "combined_rate"),
+                axis=1,
+            ),
+            "BB確率": filtered.apply(
+                lambda r: one_day_rate_text(r, "bb_rate_text", "bb_rate"),
+                axis=1,
+            ),
+            "RB確率": filtered.apply(
+                lambda r: one_day_rate_text(r, "rb_rate_text", "rb_rate"),
+                axis=1,
+            ),
+            "ART/AT確率": filtered.apply(
+                lambda r: one_day_rate_text(r, "art_rate_text", "art_rate"),
+                axis=1,
+            ),
+        })
+
+        # 1機種だけに絞られている場合は、アナスロに近い形で平均行を最後に追加。
+        unique_machine_count = filtered["machine_name"].nunique(dropna=True)
+        if unique_machine_count == 1 and len(filtered) >= 2:
+            games_sum = pd.to_numeric(filtered["games"], errors="coerce").fillna(0).sum()
+            bb_sum = pd.to_numeric(filtered["bb"], errors="coerce").fillna(0).sum()
+            rb_sum = pd.to_numeric(filtered["rb"], errors="coerce").fillna(0).sum()
+            art_sum = pd.to_numeric(filtered["art"], errors="coerce").fillna(0).sum()
+
+            avg_row = {
+                "台番号": "平均",
+                "機種名": filtered["machine_name"].dropna().iloc[0],
+                "G数": round(pd.to_numeric(filtered["games"], errors="coerce").mean()),
+                "差枚": (
+                    round(pd.to_numeric(filtered["diff_medals"], errors="coerce").mean())
+                    if has_diff else None
                 ),
-                1
-            ) AS combined_rate_period,
+                "BB": round(pd.to_numeric(filtered["bb"], errors="coerce").fillna(0).mean()),
+                "RB": round(pd.to_numeric(filtered["rb"], errors="coerce").fillna(0).mean()),
+                "ART/AT": round(pd.to_numeric(filtered["art"], errors="coerce").fillna(0).mean()),
+                "合算": (
+                    f"1/{games_sum / (bb_sum + rb_sum + art_sum):.1f}"
+                    if (bb_sum + rb_sum + art_sum) > 0 else "-"
+                ),
+                "BB確率": (
+                    f"1/{games_sum / bb_sum:.1f}"
+                    if bb_sum > 0 else "-"
+                ),
+                "RB確率": (
+                    f"1/{games_sum / rb_sum:.1f}"
+                    if rb_sum > 0 else "-"
+                ),
+                "ART/AT確率": (
+                    f"1/{games_sum / art_sum:.1f}"
+                    if art_sum > 0 else "-"
+                ),
+            }
+            display = pd.concat(
+                [display, pd.DataFrame([avg_row])],
+                ignore_index=True,
+            )
 
-            ROUND(
-                SUM(COALESCE(games, 0))::numeric
-                / NULLIF(SUM(COALESCE(bb, 0)), 0),
-                1
-            ) AS bb_rate_period,
+        c1, c2, c3 = st.columns(3)
+        c1.metric("表示日", str(selected_date))
+        c2.metric("表示台数", f"{len(filtered):,}台")
+        if has_diff:
+            day_diff = pd.to_numeric(filtered["diff_medals"], errors="coerce").sum()
+            c3.metric("表示台の差枚合計", f"{int(day_diff):+,}枚")
+        else:
+            c3.metric("差枚", "データなし")
 
-            ROUND(
-                SUM(COALESCE(games, 0))::numeric
-                / NULLIF(SUM(COALESCE(rb, 0)), 0),
-                1
-            ) AS rb_rate_period,
+        st.caption(
+            "この表示は1日分をそのまま表示しています。BB・RB・ART/AT・差枚は複数日分を足し算していません。"
+        )
 
-            ROUND(
-                SUM(COALESCE(games, 0))::numeric
-                / NULLIF(SUM(COALESCE(art, 0)), 0),
-                1
-            ) AS art_rate_period,
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-            CASE
-                WHEN COUNT(diff_medals) = 0 THEN NULL
-                ELSE SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
-            END AS win_count,
+        st.divider()
+        st.markdown("### 複数日を1日単位でExcel出力")
 
-            ROUND(
-                100.0 * SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
-                / NULLIF(COUNT(diff_medals), 0),
-                1
-            ) AS win_rate
+        available_dates_df = query_df(
+            """
+            SELECT DISTINCT date
+            FROM slot_machine_results
+            WHERE store_id = %s
+            ORDER BY date DESC
+            """,
+            (store_id,),
+        )
 
-        FROM slot_machine_results
-
-        WHERE
-            store_id = %s
-            AND date BETWEEN %s AND %s
-
-        GROUP BY machine_no
-
-        ORDER BY total_diff_medals DESC NULLS LAST, machine_no
-        """,
-        (store_id, start_date, end_date),
-    )
-
-    c1, c2 = st.columns(2)
-    min_days = c1.number_input(
-        "最低データ日数",
-        min_value=1,
-        max_value=max(1, len(pd.date_range(start_date, end_date))),
-        value=1,
-    )
-
-    has_diff_rows = (pd.to_numeric(df.get("diff_days"), errors="coerce").fillna(0) > 0).any()
-    if has_diff_rows:
-        sort_options = [
-            "総差枚が高い順",
-            "平均差枚が高い順",
-            "勝率が高い順",
-            "平均G数が高い順",
-            "合算が良い順",
-            "台番号順",
+        available_dates = [
+            pd.Timestamp(x).date()
+            for x in available_dates_df["date"].dropna().tolist()
         ]
-    else:
-        sort_options = ["平均G数が高い順", "合算が良い順", "台番号順"]
-        st.info(
-            "この店舗は差枚列がないため、差枚・勝率の並び替えは表示していません。"
-            "BB・RB・ART/AT・合算は確認できます。"
+
+        default_dates = (
+            [selected_date]
+            if selected_date in available_dates
+            else available_dates[:1]
         )
 
-    sort_choice = c2.selectbox("並び順", sort_options)
-
-    df = df[df["days"] >= min_days]
-
-    if sort_choice == "総差枚が高い順":
-        df = df.sort_values("total_diff_medals", ascending=False, na_position="last")
-    elif sort_choice == "平均差枚が高い順":
-        df = df.sort_values("avg_diff_medals", ascending=False, na_position="last")
-    elif sort_choice == "勝率が高い順":
-        df = df.sort_values("win_rate", ascending=False, na_position="last")
-    elif sort_choice == "平均G数が高い順":
-        df = df.sort_values("avg_games", ascending=False, na_position="last")
-    elif sort_choice == "合算が良い順":
-        df = df.sort_values("combined_rate_period", ascending=True, na_position="last")
-    else:
-        df = df.sort_values("machine_no")
-
-    df_display = df.copy()
-
-    for col in [
-        "combined_rate_period",
-        "bb_rate_period",
-        "rb_rate_period",
-        "art_rate_period",
-    ]:
-        df_display[col] = df_display[col].apply(
-            lambda x: f"1/{float(x):.1f}" if pd.notna(x) and float(x) > 0 else "-"
+        export_dates = st.multiselect(
+            "Excelに出力する日付（複数選択可）",
+            options=available_dates,
+            default=default_dates,
+            format_func=lambda d: d.strftime("%Y/%m/%d"),
+            key="machine_number_excel_dates",
+            help="選んだ日付は足し算せず、Excel内で1日ごとのシートに分けて出力します。",
         )
 
-    df_display = df_display.rename(
-        columns={
-            "machine_no": "台番号",
-            "days": "データ日数",
-            "diff_days": "差枚あり日数",
-            "machine_name_example": "機種名",
-            "total_diff_medals": "総差枚",
-            "avg_diff_medals": "平均差枚",
-            "avg_games": "平均G数",
-            "bb_total": "BB",
-            "rb_total": "RB",
-            "art_total": "ART/AT",
-            "combined_rate_period": "合算",
-            "bb_rate_period": "BB確率",
-            "rb_rate_period": "RB確率",
-            "art_rate_period": "ART/AT確率",
-            "win_count": "勝ち回数",
-            "win_rate": "勝率(%)",
-        }
-    )
+        export_filtered_only = st.checkbox(
+            "現在の機種絞り込みをExcelにも反映する",
+            value=True,
+            key="machine_number_excel_filter",
+        )
 
-    st.dataframe(
-        df_display,
-        use_container_width=True,
-        hide_index=True,
-    )
+        if export_dates:
+            export_df = query_df(
+                """
+                SELECT
+                    date,
+                    machine_no,
+                    machine_name,
+                    games,
+                    diff_medals,
+                    bb,
+                    rb,
+                    art,
+                    combined_rate,
+                    bb_rate,
+                    rb_rate,
+                    art_rate,
+                    combined_rate_text,
+                    bb_rate_text,
+                    rb_rate_text,
+                    art_rate_text
+                FROM slot_machine_results
+                WHERE store_id = %s
+                  AND date = ANY(%s)
+                ORDER BY date, machine_no
+                """,
+                (store_id, export_dates),
+            )
+
+            if export_filtered_only:
+                if machine_search:
+                    export_df = export_df[
+                        export_df["machine_name"]
+                        .astype(str)
+                        .str.contains(machine_search, case=False, na=False)
+                    ]
+
+                if selected_machines:
+                    export_df = export_df[
+                        export_df["machine_name"].isin(selected_machines)
+                    ]
+
+            st.caption(
+                f"選択日数：{len(export_dates)}日 / 出力行数：{len(export_df):,}行"
+            )
+
+            if export_df.empty:
+                st.warning("出力対象のデータがありません。")
+            else:
+                excel_bytes = build_multi_day_excel(
+                    export_df,
+                    store_name,
+                )
+
+                safe_store_name = re.sub(
+                    r'[\\\\/:*?"<>|]+',
+                    "_",
+                    str(store_name),
+                )
+                min_export_date = min(export_dates).strftime("%Y%m%d")
+                max_export_date = max(export_dates).strftime("%Y%m%d")
+                excel_filename = (
+                    f"{safe_store_name}_台別データ_"
+                    f"{min_export_date}-{max_export_date}.xlsx"
+                )
+
+                st.download_button(
+                    "📥 選択した日付をExcelでダウンロード",
+                    data=excel_bytes,
+                    file_name=excel_filename,
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    use_container_width=True,
+                    key="machine_number_excel_download",
+                )
+
+                st.caption(
+                    "Excelには「全日データ」「日別サマリー」に加えて、"
+                    "選択した日付ごとのシートを作成します。"
+                )
+
+    else:
+        st.caption(
+            "期間集計は、選択期間のBB・RB・ART/AT・差枚を合計し、G数や差枚は平均値も表示します。"
+        )
+
+        date_range = date_range_selector(store_id, "number")
+        if not date_range:
+            st.stop()
+        start_date, end_date = date_range
+
+        df = query_df(
+            """
+            SELECT
+                machine_no,
+                COUNT(*) AS days,
+                COUNT(diff_medals) AS diff_days,
+                MIN(machine_name) AS machine_name_example,
+                SUM(diff_medals) AS total_diff_medals,
+                ROUND(AVG(diff_medals), 1) AS avg_diff_medals,
+                ROUND(AVG(games), 1) AS avg_games,
+
+                SUM(COALESCE(bb, 0)) AS bb_total,
+                SUM(COALESCE(rb, 0)) AS rb_total,
+                SUM(COALESCE(art, 0)) AS art_total,
+
+                ROUND(
+                    SUM(COALESCE(games, 0))::numeric
+                    / NULLIF(
+                        SUM(COALESCE(bb, 0))
+                        + SUM(COALESCE(rb, 0))
+                        + SUM(COALESCE(art, 0)),
+                        0
+                    ),
+                    1
+                ) AS combined_rate_period,
+
+                ROUND(
+                    SUM(COALESCE(games, 0))::numeric
+                    / NULLIF(SUM(COALESCE(bb, 0)), 0),
+                    1
+                ) AS bb_rate_period,
+
+                ROUND(
+                    SUM(COALESCE(games, 0))::numeric
+                    / NULLIF(SUM(COALESCE(rb, 0)), 0),
+                    1
+                ) AS rb_rate_period,
+
+                ROUND(
+                    SUM(COALESCE(games, 0))::numeric
+                    / NULLIF(SUM(COALESCE(art, 0)), 0),
+                    1
+                ) AS art_rate_period,
+
+                CASE
+                    WHEN COUNT(diff_medals) = 0 THEN NULL
+                    ELSE SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
+                END AS win_count,
+
+                ROUND(
+                    100.0 * SUM(CASE WHEN diff_medals > 0 THEN 1 ELSE 0 END)
+                    / NULLIF(COUNT(diff_medals), 0),
+                    1
+                ) AS win_rate
+
+            FROM slot_machine_results
+
+            WHERE
+                store_id = %s
+                AND date BETWEEN %s AND %s
+
+            GROUP BY machine_no
+
+            ORDER BY total_diff_medals DESC NULLS LAST, machine_no
+            """,
+            (store_id, start_date, end_date),
+        )
+
+        c1, c2 = st.columns(2)
+        min_days = c1.number_input(
+            "最低データ日数",
+            min_value=1,
+            max_value=max(1, len(pd.date_range(start_date, end_date))),
+            value=1,
+        )
+
+        has_diff_rows = (
+            pd.to_numeric(df.get("diff_days"), errors="coerce")
+            .fillna(0)
+            .gt(0)
+            .any()
+        )
+
+        if has_diff_rows:
+            sort_options = [
+                "総差枚が高い順",
+                "平均差枚が高い順",
+                "勝率が高い順",
+                "平均G数が高い順",
+                "合算が良い順",
+                "台番号順",
+            ]
+        else:
+            sort_options = [
+                "平均G数が高い順",
+                "合算が良い順",
+                "台番号順",
+            ]
+            st.info(
+                "この店舗は差枚列がないため、差枚・勝率の並び替えは表示していません。"
+                "BB・RB・ART/AT・合算は確認できます。"
+            )
+
+        sort_choice = c2.selectbox(
+            "並び順",
+            sort_options,
+            key="machine_number_period_sort",
+        )
+
+        df = df[df["days"] >= min_days]
+
+        if sort_choice == "総差枚が高い順":
+            df = df.sort_values(
+                "total_diff_medals",
+                ascending=False,
+                na_position="last",
+            )
+        elif sort_choice == "平均差枚が高い順":
+            df = df.sort_values(
+                "avg_diff_medals",
+                ascending=False,
+                na_position="last",
+            )
+        elif sort_choice == "勝率が高い順":
+            df = df.sort_values(
+                "win_rate",
+                ascending=False,
+                na_position="last",
+            )
+        elif sort_choice == "平均G数が高い順":
+            df = df.sort_values(
+                "avg_games",
+                ascending=False,
+                na_position="last",
+            )
+        elif sort_choice == "合算が良い順":
+            df = df.sort_values(
+                "combined_rate_period",
+                ascending=True,
+                na_position="last",
+            )
+        else:
+            df = df.sort_values("machine_no")
+
+        df_display = df.copy()
+
+        for col in [
+            "combined_rate_period",
+            "bb_rate_period",
+            "rb_rate_period",
+            "art_rate_period",
+        ]:
+            df_display[col] = df_display[col].apply(
+                lambda x: (
+                    f"1/{float(x):.1f}"
+                    if pd.notna(x) and float(x) > 0
+                    else "-"
+                )
+            )
+
+        df_display = df_display.rename(
+            columns={
+                "machine_no": "台番号",
+                "days": "データ日数",
+                "diff_days": "差枚あり日数",
+                "machine_name_example": "機種名",
+                "total_diff_medals": "総差枚",
+                "avg_diff_medals": "平均差枚",
+                "avg_games": "平均G数",
+                "bb_total": "BB",
+                "rb_total": "RB",
+                "art_total": "ART/AT",
+                "combined_rate_period": "合算",
+                "bb_rate_period": "BB確率",
+                "rb_rate_period": "RB確率",
+                "art_rate_period": "ART/AT確率",
+                "win_count": "勝ち回数",
+                "win_rate": "勝率(%)",
+            }
+        )
+
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 elif menu == "明日のジャグラー狙い":
