@@ -542,7 +542,8 @@ def merge_store_name_aliases():
                     """,
                     (canonical_name,),
                 )
-                new_id = int(cur.fetchone()[0])
+                returned_row = cur.fetchone()
+                new_id = int(returned_row["store_id"])
 
                 if new_id == old_id:
                     continue
@@ -3732,7 +3733,16 @@ def run_strategy_backtest(
 
 
 init_db()
-merge_store_name_aliases()
+
+try:
+    merge_store_name_aliases()
+except Exception as e:
+    st.warning(
+        "店舗名の自動統合処理でエラーが発生しました。"
+        "通常の閲覧・登録は続行できます。エラー内容: "
+        + str(e)
+    )
+
 seed_special_event_defaults()
 seed_juggler_official_defaults()
 
