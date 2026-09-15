@@ -4564,34 +4564,13 @@ elif menu == "台番号別分析":
         st.divider()
         st.markdown("### 複数日を1日単位でExcel出力")
 
-        available_dates_df = query_df(
-            """
-            SELECT DISTINCT date
-            FROM slot_machine_results
-            WHERE store_id = %s
-            ORDER BY date DESC
-            """,
-            (store_id,),
-        )
-
-        available_dates = [
-            pd.Timestamp(x).date()
-            for x in available_dates_df["date"].dropna().tolist()
-        ]
-
-        default_dates = (
-            [selected_date]
-            if selected_date in available_dates
-            else available_dates[:1]
-        )
-
-        export_dates = st.multiselect(
-            "Excelに出力する日付（複数選択可）",
-            options=available_dates,
-            default=default_dates,
-            format_func=lambda d: d.strftime("%Y/%m/%d"),
-            key="machine_number_excel_dates",
-            help="選んだ日付は足し算せず、Excel内で1日ごとのシートに分けて出力します。",
+        export_range = st.date_input(
+            "Excelに出力する期間",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key="machine_number_excel_range",
+            help="開始日と終了日を選んでください。期間内の各日は足し算せず、1日ごとのシートに分けて出力します。",
         )
 
         export_filtered_only = st.checkbox(
@@ -4600,7 +4579,15 @@ elif menu == "台番号別分析":
             key="machine_number_excel_filter",
         )
 
-        if export_dates:
+        if isinstance(export_range, (list, tuple)) and len(export_range) == 2:
+            export_start_date, export_end_date = export_range
+
+            if export_start_date > export_end_date:
+                export_start_date, export_end_date = (
+                    export_end_date,
+                    export_start_date,
+                )
+
             export_df = query_df(
                 """
                 SELECT
@@ -4622,10 +4609,10 @@ elif menu == "台番号別分析":
                     art_rate_text
                 FROM slot_machine_results
                 WHERE store_id = %s
-                  AND date = ANY(%s)
+                  AND date BETWEEN %s AND %s
                 ORDER BY date, machine_no
                 """,
-                (store_id, export_dates),
+                (store_id, export_start_date, export_end_date),
             )
 
             if export_filtered_only:
@@ -4641,12 +4628,21 @@ elif menu == "台番号別分析":
                         export_df["machine_name"].isin(selected_machines)
                     ]
 
+            actual_days = (
+                pd.to_datetime(export_df["date"]).dt.date.nunique()
+                if not export_df.empty
+                else 0
+            )
+
             st.caption(
-                f"選択日数：{len(export_dates)}日 / 出力行数：{len(export_df):,}行"
+                f"出力期間：{export_start_date.strftime('%Y/%m/%d')} ～ "
+                f"{export_end_date.strftime('%Y/%m/%d')} / "
+                f"データあり日数：{actual_days}日 / "
+                f"出力行数：{len(export_df):,}行"
             )
 
             if export_df.empty:
-                st.warning("出力対象のデータがありません。")
+                st.warning("この期間には出力対象のデータがありません。")
             else:
                 excel_bytes = build_multi_day_excel(
                     export_df,
@@ -4658,15 +4654,15 @@ elif menu == "台番号別分析":
                     "_",
                     str(store_name),
                 )
-                min_export_date = min(export_dates).strftime("%Y%m%d")
-                max_export_date = max(export_dates).strftime("%Y%m%d")
+                min_export_date = export_start_date.strftime("%Y%m%d")
+                max_export_date = export_end_date.strftime("%Y%m%d")
                 excel_filename = (
                     f"{safe_store_name}_台別データ_"
                     f"{min_export_date}-{max_export_date}.xlsx"
                 )
 
                 st.download_button(
-                    "📥 選択した日付をExcelでダウンロード",
+                    "📥 この期間をExcelでダウンロード",
                     data=excel_bytes,
                     file_name=excel_filename,
                     mime=(
@@ -4679,8 +4675,11 @@ elif menu == "台番号別分析":
 
                 st.caption(
                     "Excelには「全日データ」「日別サマリー」に加えて、"
-                    "選択した日付ごとのシートを作成します。"
+                    "期間内でデータが存在する日付ごとのシートを作成します。"
+                    "BB・RB・差枚などは複数日で合算せず、各日を別シートで確認できます。"
                 )
+        else:
+            st.info("開始日と終了日の2つを選択してください。")
 
     else:
         st.caption(
