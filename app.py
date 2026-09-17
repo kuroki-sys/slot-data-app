@@ -335,6 +335,20 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_slot_juggler_alias_spec
         ON slot_juggler_aliases(spec_id);
 
+    CREATE TABLE IF NOT EXISTS slot_deep_prediction_runs (
+        run_id BIGSERIAL PRIMARY KEY,
+        store_id BIGINT NOT NULL REFERENCES slot_stores(store_id) ON DELETE CASCADE,
+        target_date DATE NOT NULL,
+        pattern_label TEXT,
+        latest_data_date DATE,
+        payload JSONB NOT NULL,
+        note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_slot_deep_prediction_runs_store_target
+        ON slot_deep_prediction_runs(store_id, target_date, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS slot_schema_migrations (
         migration_key TEXT PRIMARY KEY,
         migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -2307,6 +2321,911 @@ def exact_machine_windows(machine_nos, block_size):
     return windows
 
 
+
+JP_WEEKDAYS = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+
+
+def deep_ordinal_weekday_info(value):
+    dt = pd.Timestamp(value)
+    ordinal = (dt.day - 1) // 7 + 1
+    weekday = JP_WEEKDAYS[dt.weekday()]
+    return ordinal, weekday, f"第{ordinal}{weekday}"
+
+
+def deep_month_distance(past_date, target_date):
+    past = pd.Timestamp(past_date)
+    target = pd.Timestamp(target_date)
+    return (target.year - past.year) * 12 + (target.month - past.month)
+
+
+def deep_matching_calendar_dates(all_dates, target_date):
+    target = pd.Timestamp(target_date)
+    ordinal, _, label = deep_ordinal_weekday_info(target)
+
+    dates = sorted(
+        pd.Timestamp(x)
+        for x in pd.Series(all_dates).dropna().unique()
+        if pd.Timestamp(x) < target
+    )
+
+    matched = [
+        d
+        for d in dates
+        if d.weekday() == target.weekday()
+        and ((d.day - 1) // 7 + 1) == ordinal
+    ]
+    same_weekday = [
+        d
+        for d in dates
+        if d.weekday() == target.weekday()
+    ]
+    return matched, same_weekday, label
+
+
+def deep_safe_sum(series):
+    values = pd.to_numeric(series, errors="coerce")
+    if values.notna().sum() == 0:
+        return np.nan
+    return values.sum()
+
+
+def deep_daily_store_table(history):
+    if history.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for date_value, g in history.groupby("date"):
+        diff = pd.to_numeric(g["diff_medals"], errors="coerce")
+        games = pd.to_numeric(g["games"], errors="coerce")
+        rows.append(
+            {
+                "date": pd.Timestamp(date_value),
+                "total_diff": deep_safe_sum(diff),
+                "avg_diff": diff.mean() if diff.notna().any() else np.nan,
+                "avg_games": games.mean() if games.notna().any() else np.nan,
+                "machine_count": int(g["machine_no"].nunique()),
+                "diff_rows": int(diff.notna().sum()),
+                "win_rate": (
+                    float((diff.dropna() > 0).mean() * 100)
+                    if diff.notna().any()
+                    else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
+
+def deep_compare_calendar_pattern(history, target_date, pattern_dates, same_weekday_dates):
+    daily = deep_daily_store_table(history)
+    if daily.empty:
+        return pd.DataFrame()
+
+    pattern_set = set(pd.Timestamp(x) for x in pattern_dates)
+    weekday_set = set(pd.Timestamp(x) for x in same_weekday_dates)
+
+    def summarize(label, dates):
+        x = daily[daily["date"].isin(dates)].copy()
+        diff_x = x[x["total_diff"].notna()].copy()
+        return {
+            "区分": label,
+            "対象日数": int(len(x)),
+            "差枚あり日数": int(len(diff_x)),
+            "平均総差枚": (
+                round(float(diff_x["total_diff"].mean()))
+                if not diff_x.empty else np.nan
+            ),
+            "プラス日率(%)": (
+                round(float((diff_x["total_diff"] > 0).mean() * 100), 1)
+                if not diff_x.empty else np.nan
+            ),
+            "平均台差枚": (
+                round(float(x["avg_diff"].mean()), 1)
+                if x["avg_diff"].notna().any() else np.nan
+            ),
+            "平均G数": (
+                round(float(x["avg_games"].mean()))
+                if x["avg_games"].notna().any() else np.nan
+            ),
+        }
+
+    other_same_weekday = weekday_set - pattern_set
+
+    rows = [
+        summarize(deep_ordinal_weekday_info(target_date)[2], pattern_set),
+        summarize("その他の同じ曜日", other_same_weekday),
+    ]
+    return pd.DataFrame(rows)
+
+
+def deep_current_layout(history):
+    if history.empty:
+        return pd.DataFrame(), None
+    latest = history["date"].max()
+    current = (
+        history[history["date"] == latest][
+            ["machine_no", "machine_name", "games", "diff_medals", "bb", "rb", "art"]
+        ]
+        .drop_duplicates("machine_no")
+        .copy()
+    )
+    current["machine_no"] = pd.to_numeric(current["machine_no"], errors="coerce")
+    current = current.dropna(subset=["machine_no"])
+    current["machine_no"] = current["machine_no"].astype(int)
+    return current.sort_values("machine_no"), pd.Timestamp(latest)
+
+
+def deep_block_history(
+    history,
+    current,
+    target_date,
+    pattern_dates,
+    block_size=4,
+    avg_threshold=500,
+    win_threshold=75,
+):
+    if history.empty or current.empty or not pattern_dates:
+        return pd.DataFrame()
+
+    current_nos = sorted(current["machine_no"].astype(int).unique().tolist())
+    windows = exact_machine_windows(current_nos, block_size)
+    if not windows:
+        return pd.DataFrame()
+
+    pattern_set = set(pd.Timestamp(x) for x in pattern_dates)
+    source = history[
+        history["date"].isin(pattern_set)
+        & pd.to_numeric(history["diff_medals"], errors="coerce").notna()
+    ].copy()
+
+    if source.empty:
+        return pd.DataFrame()
+
+    source["diff_medals"] = pd.to_numeric(source["diff_medals"], errors="coerce")
+    pivot = source.pivot_table(
+        index="date",
+        columns="machine_no",
+        values="diff_medals",
+        aggfunc="first",
+    )
+
+    composition_map = (
+        current.set_index("machine_no")["machine_name"]
+        .fillna("")
+        .astype(str)
+        .to_dict()
+    )
+
+    ordered_pattern_dates = sorted(pattern_set)
+    pattern_index = {d: i for i, d in enumerate(ordered_pattern_dates)}
+    target_occurrence_index = len(ordered_pattern_dates)
+
+    rows = []
+
+    for window in windows:
+        if any(no not in pivot.columns for no in window):
+            continue
+
+        values = pivot[list(window)]
+        valid = values.notna().all(axis=1)
+        values = values.loc[valid]
+        if values.empty:
+            continue
+
+        daily = pd.DataFrame(
+            {
+                "date": values.index,
+                "avg_diff": values.mean(axis=1).values,
+                "win_rate": (values.gt(0).mean(axis=1) * 100).values,
+                "sum_diff": values.sum(axis=1).values,
+            }
+        )
+        daily["strong"] = (
+            (daily["avg_diff"] >= avg_threshold)
+            & (daily["win_rate"] >= win_threshold)
+        )
+
+        strong_dates = sorted(pd.Timestamp(x) for x in daily.loc[daily["strong"], "date"])
+        valid_dates = sorted(pd.Timestamp(x) for x in daily["date"])
+
+        strong_positions = [
+            pattern_index[d]
+            for d in strong_dates
+            if d in pattern_index
+        ]
+
+        strong_gaps = [
+            strong_positions[i] - strong_positions[i - 1]
+            for i in range(1, len(strong_positions))
+        ]
+
+        mode_gap = None
+        mode_gap_rate = np.nan
+        if strong_gaps:
+            gap_series = pd.Series(strong_gaps)
+            mode_gap = int(gap_series.mode().iloc[0])
+            mode_gap_rate = float((gap_series == mode_gap).mean() * 100)
+
+        last_strong = strong_dates[-1] if strong_dates else pd.NaT
+        if pd.notna(last_strong):
+            last_pos = pattern_index.get(last_strong)
+            target_gap = (
+                target_occurrence_index - last_pos
+                if last_pos is not None else np.nan
+            )
+            months_since = deep_month_distance(last_strong, target_date)
+        else:
+            target_gap = np.nan
+            months_since = np.nan
+
+        # 直後の同パターンで再度強かった比率
+        next_checks = []
+        skip_checks = []
+        strong_set = set(strong_positions)
+        valid_pos_set = {
+            pattern_index[d]
+            for d in valid_dates
+            if d in pattern_index
+        }
+
+        for pos in strong_positions:
+            if pos + 1 in valid_pos_set:
+                next_checks.append(1 if (pos + 1) in strong_set else 0)
+            if pos + 2 in valid_pos_set:
+                skip_checks.append(1 if (pos + 2) in strong_set else 0)
+
+        consecutive_rate = (
+            float(np.mean(next_checks) * 100)
+            if next_checks else np.nan
+        )
+        skip_one_rate = (
+            float(np.mean(skip_checks) * 100)
+            if skip_checks else np.nan
+        )
+
+        if pd.isna(months_since):
+            rotation_status = "過去強日なし"
+        elif months_since <= 0:
+            rotation_status = "今月使用"
+        elif months_since == 1:
+            rotation_status = "前月使用"
+        elif months_since == 2:
+            rotation_status = "1か月空き"
+        elif months_since == 3:
+            rotation_status = "2か月空き"
+        else:
+            rotation_status = f"{months_since - 1}か月以上空き"
+
+        names = []
+        for no in window:
+            name = composition_map.get(no, "")
+            if name and name not in names:
+                names.append(name)
+
+        rows.append(
+            {
+                "ブロック": f"{window[0]}～{window[-1]}",
+                "開始台": int(window[0]),
+                "終了台": int(window[-1]),
+                "現在機種": " / ".join(names),
+                "比較回数": int(len(daily)),
+                "強かった回数": int(daily["strong"].sum()),
+                "強かった率(%)": round(float(daily["strong"].mean() * 100), 1),
+                "平均差枚/台": round(float(daily["avg_diff"].mean()), 1),
+                "平均勝率(%)": round(float(daily["win_rate"].mean()), 1),
+                "直近強日": (
+                    last_strong.date() if pd.notna(last_strong) else None
+                ),
+                "今回までの月差": (
+                    int(months_since) if pd.notna(months_since) else None
+                ),
+                "今回ローテ": rotation_status,
+                "過去の主な再登場間隔": (
+                    f"{mode_gap}回後" if mode_gap is not None else "-"
+                ),
+                "主間隔一致率(%)": (
+                    round(mode_gap_rate, 1) if pd.notna(mode_gap_rate) else np.nan
+                ),
+                "今回の間隔": (
+                    f"{int(target_gap)}回後" if pd.notna(target_gap) else "-"
+                ),
+                "連続採用率(%)": (
+                    round(consecutive_rate, 1)
+                    if pd.notna(consecutive_rate) else np.nan
+                ),
+                "1回休み再採用率(%)": (
+                    round(skip_one_rate, 1)
+                    if pd.notna(skip_one_rate) else np.nan
+                ),
+                "_target_gap": target_gap,
+                "_mode_gap": mode_gap,
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    result["_freq"] = rank_score(result["強かった率(%)"], True)
+    result["_avg"] = rank_score(result["平均差枚/台"], True)
+    result["_sample"] = rank_score(result["比較回数"], True)
+
+    def gap_fit(row):
+        if pd.isna(row["_target_gap"]) or row["_mode_gap"] is None:
+            return 50.0
+        gap = abs(float(row["_target_gap"]) - float(row["_mode_gap"]))
+        if gap == 0:
+            return 100.0
+        if gap == 1:
+            return 70.0
+        if gap == 2:
+            return 45.0
+        return 25.0
+
+    result["_gapfit"] = result.apply(gap_fit, axis=1)
+    result["ローテ総合点"] = (
+        result["_freq"] * 0.38
+        + result["_avg"] * 0.25
+        + result["_gapfit"] * 0.25
+        + result["_sample"] * 0.12
+    ).round(1)
+
+    result["根拠"] = result.apply(
+        lambda r: (
+            f"{deep_ordinal_weekday_info(target_date)[2]}で"
+            f"{int(r['強かった回数'])}/{int(r['比較回数'])}回強い。"
+            f"直近は{r['今回ローテ']}。"
+            f"過去の主な再登場は{r['過去の主な再登場間隔']}。"
+        ),
+        axis=1,
+    )
+
+    return result.sort_values(
+        ["ローテ総合点", "強かった率(%)", "平均差枚/台"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def deep_machine_number_history(history, current, pattern_dates):
+    if history.empty or current.empty or not pattern_dates:
+        return pd.DataFrame()
+
+    pattern_set = set(pd.Timestamp(x) for x in pattern_dates)
+    source = history[
+        history["date"].isin(pattern_set)
+        & pd.to_numeric(history["diff_medals"], errors="coerce").notna()
+    ].copy()
+
+    if source.empty:
+        return pd.DataFrame()
+
+    source["diff_medals"] = pd.to_numeric(source["diff_medals"], errors="coerce")
+
+    grouped = (
+        source.groupby("machine_no")
+        .agg(
+            比較回数=("date", "nunique"),
+            平均差枚=("diff_medals", "mean"),
+            プラス回数=("diff_medals", lambda s: int((s > 0).sum())),
+            プラス率=("diff_medals", lambda s: float((s > 0).mean() * 100)),
+            直近実績=("diff_medals", "last"),
+        )
+        .reset_index()
+    )
+
+    current_names = (
+        current[["machine_no", "machine_name"]]
+        .drop_duplicates("machine_no")
+        .rename(columns={"machine_name": "現在機種"})
+    )
+    grouped = grouped.merge(current_names, on="machine_no", how="inner")
+    grouped = grouped.rename(columns={"machine_no": "台番号"})
+
+    grouped["_avg"] = rank_score(grouped["平均差枚"], True)
+    grouped["_plus"] = rank_score(grouped["プラス率"], True)
+    grouped["_sample"] = rank_score(grouped["比較回数"], True)
+    grouped["台番傾向点"] = (
+        grouped["_avg"] * 0.50
+        + grouped["_plus"] * 0.35
+        + grouped["_sample"] * 0.15
+    ).round(1)
+
+    grouped["平均差枚"] = grouped["平均差枚"].round(1)
+    grouped["プラス率"] = grouped["プラス率"].round(1)
+
+    return grouped.sort_values(
+        ["台番傾向点", "平均差枚"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+
+def deep_suffix_history(history, pattern_dates):
+    if history.empty or not pattern_dates:
+        return pd.DataFrame()
+
+    pattern_set = set(pd.Timestamp(x) for x in pattern_dates)
+    source = history[
+        history["date"].isin(pattern_set)
+        & pd.to_numeric(history["diff_medals"], errors="coerce").notna()
+    ].copy()
+
+    if source.empty:
+        return pd.DataFrame()
+
+    source["machine_no"] = pd.to_numeric(source["machine_no"], errors="coerce")
+    source = source.dropna(subset=["machine_no"])
+    source["machine_no"] = source["machine_no"].astype(int)
+    source["末尾"] = source["machine_no"] % 10
+    source["diff_medals"] = pd.to_numeric(source["diff_medals"], errors="coerce")
+
+    daily = (
+        source.groupby(["date", "末尾"])
+        .agg(
+            平均差枚=("diff_medals", "mean"),
+            勝率=("diff_medals", lambda s: float((s > 0).mean() * 100)),
+            台数=("machine_no", "size"),
+        )
+        .reset_index()
+    )
+
+    grouped = (
+        daily.groupby("末尾")
+        .agg(
+            比較回数=("date", "nunique"),
+            平均差枚=("平均差枚", "mean"),
+            平均勝率=("勝率", "mean"),
+        )
+        .reset_index()
+    )
+
+    grouped["_diff"] = rank_score(grouped["平均差枚"], True)
+    grouped["_win"] = rank_score(grouped["平均勝率"], True)
+    grouped["_sample"] = rank_score(grouped["比較回数"], True)
+    grouped["末尾傾向点"] = (
+        grouped["_diff"] * 0.55
+        + grouped["_win"] * 0.35
+        + grouped["_sample"] * 0.10
+    ).round(1)
+    grouped["平均差枚"] = grouped["平均差枚"].round(1)
+    grouped["平均勝率"] = grouped["平均勝率"].round(1)
+
+    return grouped.sort_values(
+        ["末尾傾向点", "平均差枚"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+
+def deep_machine_rotation(history, current, target_date, pattern_dates, avg_threshold=500, win_threshold=60):
+    if history.empty or current.empty or not pattern_dates:
+        return pd.DataFrame()
+
+    pattern_set = set(pd.Timestamp(x) for x in pattern_dates)
+    source = history[
+        history["date"].isin(pattern_set)
+        & pd.to_numeric(history["diff_medals"], errors="coerce").notna()
+    ].copy()
+    if source.empty:
+        return pd.DataFrame()
+
+    source["diff_medals"] = pd.to_numeric(source["diff_medals"], errors="coerce")
+
+    daily = (
+        source.groupby(["date", "machine_name"])
+        .agg(
+            台数=("machine_no", "nunique"),
+            平均差枚=("diff_medals", "mean"),
+            勝率=("diff_medals", lambda s: float((s > 0).mean() * 100)),
+        )
+        .reset_index()
+    )
+    daily["strong"] = (
+        (daily["台数"] >= 2)
+        & (daily["平均差枚"] >= avg_threshold)
+        & (daily["勝率"] >= win_threshold)
+    )
+
+    active_names = set(current["machine_name"].dropna().astype(str).unique())
+    daily = daily[daily["machine_name"].astype(str).isin(active_names)].copy()
+    if daily.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for name, g in daily.groupby("machine_name"):
+        g = g.sort_values("date")
+        strong = g[g["strong"]]
+        last_strong = strong["date"].max() if not strong.empty else pd.NaT
+        months_since = (
+            deep_month_distance(last_strong, target_date)
+            if pd.notna(last_strong) else np.nan
+        )
+        rows.append(
+            {
+                "機種名": name,
+                "比較回数": int(g["date"].nunique()),
+                "強かった回数": int(g["strong"].sum()),
+                "強かった率(%)": round(float(g["strong"].mean() * 100), 1),
+                "平均差枚/台": round(float(g["平均差枚"].mean()), 1),
+                "平均勝率(%)": round(float(g["勝率"].mean()), 1),
+                "直近強日": (
+                    pd.Timestamp(last_strong).date()
+                    if pd.notna(last_strong) else None
+                ),
+                "月差": (
+                    int(months_since) if pd.notna(months_since) else None
+                ),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    result["_freq"] = rank_score(result["強かった率(%)"], True)
+    result["_avg"] = rank_score(result["平均差枚/台"], True)
+
+    # 「ずっと強い」だけでなく、しばらく使われていない機種もローテ候補として評価
+    gap_numeric = pd.to_numeric(result["月差"], errors="coerce")
+    gap_preference = gap_numeric.apply(
+        lambda x: (
+            50.0 if pd.isna(x)
+            else 55.0 if x <= 1
+            else 100.0 if x == 2
+            else 85.0 if x == 3
+            else 65.0
+        )
+    )
+
+    result["機種ローテ点"] = (
+        result["_freq"] * 0.45
+        + result["_avg"] * 0.30
+        + gap_preference * 0.25
+    ).round(1)
+
+    result["ローテ説明"] = result.apply(
+        lambda r: (
+            "前月使用"
+            if r["月差"] == 1
+            else "1か月空き"
+            if r["月差"] == 2
+            else "2か月空き"
+            if r["月差"] == 3
+            else "過去強日なし"
+            if pd.isna(r["月差"])
+            else f"{max(int(r['月差']) - 1, 0)}か月以上空き"
+        ),
+        axis=1,
+    )
+
+    return result.sort_values(
+        ["機種ローテ点", "強かった率(%)"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+
+def deep_recent_features(history, current):
+    if history.empty or current.empty:
+        return pd.DataFrame()
+
+    dates = sorted(pd.Timestamp(x) for x in history["date"].dropna().unique())
+    recent_dates = dates[-5:]
+    source = history[history["date"].isin(recent_dates)].copy()
+
+    rows = []
+    for no, g in source.groupby("machine_no"):
+        g = g.sort_values("date")
+        diff = pd.to_numeric(g["diff_medals"], errors="coerce")
+        games = pd.to_numeric(g["games"], errors="coerce")
+        bb = pd.to_numeric(g["bb"], errors="coerce").fillna(0)
+        rb = pd.to_numeric(g["rb"], errors="coerce").fillna(0)
+        art = pd.to_numeric(g["art"], errors="coerce").fillna(0)
+
+        diff_valid = g.loc[diff.notna()].copy()
+        valid_diff = pd.to_numeric(diff_valid["diff_medals"], errors="coerce")
+
+        last_diff = valid_diff.iloc[-1] if len(valid_diff) else np.nan
+        last2 = valid_diff.tail(2)
+        last3 = valid_diff.tail(3)
+        last5 = valid_diff.tail(5)
+
+        rows.append(
+            {
+                "machine_no": int(no),
+                "直近差枚あり日数": int(diff.notna().sum()),
+                "直近差枚": float(last_diff) if pd.notna(last_diff) else np.nan,
+                "直近2回差枚": (
+                    float(last2.sum()) if len(last2) else np.nan
+                ),
+                "直近3回差枚": (
+                    float(last3.sum()) if len(last3) else np.nan
+                ),
+                "直近5回差枚": (
+                    float(last5.sum()) if len(last5) else np.nan
+                ),
+                "直近平均G数": (
+                    round(float(games.mean()))
+                    if games.notna().any() else np.nan
+                ),
+                "直近BB": int(bb.sum()),
+                "直近RB": int(rb.sum()),
+                "直近ART/AT": int(art.sum()),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    current_names = (
+        current[["machine_no", "machine_name"]]
+        .drop_duplicates("machine_no")
+    )
+    result = result.merge(current_names, on="machine_no", how="inner")
+
+    result["上げ候補点"] = rank_score(result["直近3回差枚"], False)
+    result["据え候補点"] = rank_score(result["直近差枚"], True)
+
+    def recent_signal(row):
+        if int(row["直近差枚あり日数"]) == 0:
+            return 50.0, "差枚なし"
+        up = float(row["上げ候補点"])
+        hold = float(row["据え候補点"])
+        if up >= hold:
+            return up, "凹みからの上げ候補"
+        return hold, "直近好調の据え候補"
+
+    sig = result.apply(recent_signal, axis=1)
+    result["直近補正点"] = [x[0] for x in sig]
+    result["直近タイプ"] = [x[1] for x in sig]
+
+    return result.sort_values(
+        ["直近補正点", "直近平均G数"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+
+def deep_event_machine_history(cache, target_date, events_df, selected_tags):
+    if not selected_tags:
+        return pd.DataFrame(), []
+
+    result, matched_dates = score_special_event_cached(
+        cache,
+        target_date,
+        events_df,
+        selected_tags,
+    )
+    if result.empty:
+        return result, matched_dates
+
+    result = result.rename(
+        columns={
+            "machine_name": "機種名",
+            "event_days": "イベント比較回数",
+            "avg_diff": "イベント平均差枚",
+            "win_rate": "イベント勝率(%)",
+            "score": "イベント点",
+        }
+    )
+    return result, matched_dates
+
+
+def deep_build_final_candidates(
+    current,
+    pin_df,
+    block_df,
+    machine_df,
+    suffix_df,
+    recent_df,
+    event_df=None,
+):
+    if current.empty:
+        return pd.DataFrame()
+
+    base = (
+        current[["machine_no", "machine_name"]]
+        .drop_duplicates("machine_no")
+        .rename(columns={"machine_no": "台番号", "machine_name": "機種名"})
+        .copy()
+    )
+    base["末尾"] = base["台番号"].astype(int) % 10
+
+    if not pin_df.empty:
+        base = base.merge(
+            pin_df[["台番号", "台番傾向点", "比較回数", "平均差枚", "プラス率"]],
+            on="台番号",
+            how="left",
+        )
+    else:
+        for c in ["台番傾向点", "比較回数", "平均差枚", "プラス率"]:
+            base[c] = np.nan
+
+    block_score_map = {}
+    block_name_map = {}
+    if not block_df.empty:
+        for _, row in block_df.iterrows():
+            for no in range(int(row["開始台"]), int(row["終了台"]) + 1):
+                score = float(row["ローテ総合点"])
+                if score > block_score_map.get(no, -1):
+                    block_score_map[no] = score
+                    block_name_map[no] = str(row["ブロック"])
+    base["並びローテ点"] = base["台番号"].map(block_score_map)
+    base["並び候補"] = base["台番号"].map(block_name_map).fillna("")
+
+    if not machine_df.empty:
+        base = base.merge(
+            machine_df[["機種名", "機種ローテ点", "強かった率(%)", "ローテ説明"]],
+            on="機種名",
+            how="left",
+        )
+    else:
+        for c in ["機種ローテ点", "強かった率(%)", "ローテ説明"]:
+            base[c] = np.nan
+
+    if not suffix_df.empty:
+        base = base.merge(
+            suffix_df[["末尾", "末尾傾向点"]],
+            on="末尾",
+            how="left",
+        )
+    else:
+        base["末尾傾向点"] = np.nan
+
+    if not recent_df.empty:
+        recent_merge = recent_df[
+            [
+                "machine_no",
+                "直近補正点",
+                "直近タイプ",
+                "直近3回差枚",
+                "直近平均G数",
+            ]
+        ].rename(columns={"machine_no": "台番号"})
+        base = base.merge(recent_merge, on="台番号", how="left")
+    else:
+        for c in ["直近補正点", "直近タイプ", "直近3回差枚", "直近平均G数"]:
+            base[c] = np.nan
+
+    if event_df is not None and not event_df.empty:
+        base = base.merge(
+            event_df[["機種名", "イベント点", "イベント比較回数"]],
+            on="機種名",
+            how="left",
+        )
+    else:
+        base["イベント点"] = np.nan
+        base["イベント比較回数"] = np.nan
+
+    weights = {
+        "台番傾向点": 0.25,
+        "並びローテ点": 0.25,
+        "機種ローテ点": 0.15,
+        "末尾傾向点": 0.10,
+        "直近補正点": 0.15,
+        "イベント点": 0.10,
+    }
+
+    def calc_score(row):
+        num = 0.0
+        den = 0.0
+        for col, w in weights.items():
+            val = row.get(col)
+            if pd.notna(val):
+                num += float(val) * w
+                den += w
+        return round(num / den, 1) if den > 0 else np.nan
+
+    base["深掘り総合点"] = base.apply(calc_score, axis=1)
+
+    def rank_label(v):
+        if pd.isna(v):
+            return "-"
+        if v >= 80:
+            return "S"
+        if v >= 70:
+            return "A"
+        if v >= 60:
+            return "B"
+        return "C"
+
+    base["ランク"] = base["深掘り総合点"].apply(rank_label)
+
+    def reason(row):
+        parts = []
+        if pd.notna(row.get("並びローテ点")) and row["並びローテ点"] >= 65:
+            parts.append(f"並び{row.get('並び候補', '')}")
+        if pd.notna(row.get("台番傾向点")) and row["台番傾向点"] >= 65:
+            parts.append("同特定日の台番実績")
+        if pd.notna(row.get("機種ローテ点")) and row["機種ローテ点"] >= 65:
+            parts.append(str(row.get("ローテ説明") or "機種ローテ"))
+        if pd.notna(row.get("末尾傾向点")) and row["末尾傾向点"] >= 70:
+            parts.append(f"末尾{int(row['末尾'])}")
+        if pd.notna(row.get("直近補正点")) and row["直近補正点"] >= 70:
+            parts.append(str(row.get("直近タイプ") or "直近補正"))
+        if pd.notna(row.get("イベント点")) and row["イベント点"] >= 65:
+            parts.append("同イベント実績")
+        if not parts:
+            parts.append("複数指標の総合評価")
+        return "・".join(parts[:4])
+
+    base["主な根拠"] = base.apply(reason, axis=1)
+
+    return base.sort_values(
+        ["深掘り総合点", "台番傾向点"],
+        ascending=[False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def deep_prediction_payload(
+    store_name,
+    target_date,
+    pattern_label,
+    latest_data_date,
+    comparison_df,
+    block_df,
+    machine_df,
+    suffix_df,
+    final_df,
+    selected_event_tags,
+    matched_event_dates,
+):
+    def records(df, n):
+        if df is None or df.empty:
+            return []
+        return json.loads(
+            df.head(n).to_json(
+                orient="records",
+                force_ascii=False,
+                date_format="iso",
+            )
+        )
+
+    return {
+        "store_name": str(store_name),
+        "target_date": str(target_date),
+        "pattern_label": str(pattern_label),
+        "latest_data_date": str(latest_data_date),
+        "selected_event_tags": list(selected_event_tags or []),
+        "matched_event_dates": [str(pd.Timestamp(x).date()) for x in matched_event_dates],
+        "calendar_comparison": records(comparison_df, 10),
+        "top_blocks": records(block_df, 20),
+        "top_machines": records(machine_df, 20),
+        "suffixes": records(suffix_df, 10),
+        "top_candidates": records(final_df, 50),
+    }
+
+
+def save_deep_prediction(
+    store_id,
+    target_date,
+    pattern_label,
+    latest_data_date,
+    payload,
+    note="",
+):
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO slot_deep_prediction_runs
+                    (store_id, target_date, pattern_label, latest_data_date, payload, note)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                RETURNING run_id
+                """,
+                (
+                    store_id,
+                    target_date,
+                    pattern_label,
+                    latest_data_date,
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    str(note or ""),
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    clear_cache()
+    return int(row["run_id"])
+
+
+
 def prepare_strategy_cache(df, block_size=3):
     """狙い分析用の集計を一度だけ作る。"""
     data = df.copy()
@@ -3931,6 +4850,7 @@ menu = st.sidebar.radio(
         "ジャグラー設定判別",
         "ジャグラー公式スペック管理",
         "店舗別イベント管理",
+        "深掘り考察",
         "狙い分析",
     ],
 )
@@ -5708,6 +6628,544 @@ elif menu == "店舗別イベント管理":
             if b2.button("このイベントを削除", key="delete_store_event_button"):
                 delete_store_event(store_id, selected_event_id)
                 st.success("イベントを削除しました。")
+                st.rerun()
+
+
+
+elif menu == "深掘り考察":
+    st.subheader("🧠 深掘り考察")
+    st.write(
+        "店舗と狙う日を選ぶと、同じ第○曜日・過去の並び位置・機種ローテ・"
+        "台番号・末尾・直近の上げ/据え・登録イベントをまとめて分析します。"
+    )
+    st.caption(
+        "狙う日より後のデータは一切使いません。点数は設定投入確率ではなく、"
+        "過去実績を比較するための相対スコアです。"
+    )
+
+    store_id, store_name = store_selector()
+    if store_id is None:
+        st.info("店舗データがありません。")
+        st.stop()
+
+    analysis_data = query_df(
+        """
+        SELECT
+            date,
+            store_id,
+            machine_no,
+            machine_name,
+            games,
+            diff_medals,
+            bb,
+            rb,
+            art,
+            combined_rate,
+            bb_rate,
+            rb_rate,
+            art_rate
+        FROM slot_machine_results
+        WHERE store_id = %s
+        ORDER BY date, machine_no
+        """,
+        (store_id,),
+    )
+
+    if analysis_data.empty:
+        st.info("台別データがありません。")
+        st.stop()
+
+    analysis_data["date"] = pd.to_datetime(analysis_data["date"])
+    for col in ["machine_no", "games", "diff_medals", "bb", "rb", "art"]:
+        analysis_data[col] = pd.to_numeric(analysis_data[col], errors="coerce")
+
+    min_date = analysis_data["date"].min().date()
+    max_date = analysis_data["date"].max().date()
+    default_target = max_date + timedelta(days=1)
+
+    c1, c2, c3 = st.columns(3)
+    target_date = c1.date_input(
+        "狙う日",
+        value=default_target,
+        min_value=min_date + timedelta(days=1),
+        max_value=max(default_target + timedelta(days=365), datetime.now().date() + timedelta(days=365)),
+        key="deep_target_date",
+    )
+    block_size = c2.selectbox(
+        "並び台数",
+        [4, 3, 5],
+        index=0,
+        key="deep_block_size",
+        help="ピーアーク三田のように4台仕掛けを疑う場合は4台を選びます。",
+    )
+    recent_days_label = c3.selectbox(
+        "直近表示",
+        ["直近5データ日"],
+        index=0,
+        key="deep_recent_days",
+    )
+
+    history = analysis_data[
+        analysis_data["date"] < pd.Timestamp(target_date)
+    ].copy()
+
+    if history.empty:
+        st.warning("この日より前のデータがないため分析できません。")
+        st.stop()
+
+    current, latest_data_date = deep_current_layout(history)
+    if current.empty:
+        st.warning("最新の台配置を取得できませんでした。")
+        st.stop()
+
+    pattern_dates, same_weekday_dates, pattern_label = deep_matching_calendar_dates(
+        history["date"],
+        target_date,
+    )
+
+    events_df = query_df(
+        """
+        SELECT
+            date,
+            event_name,
+            event_tags,
+            full_machine_names,
+            half_machine_names,
+            tail_targets,
+            line_targets,
+            other_features,
+            source_label,
+            confidence,
+            note
+        FROM slot_store_events
+        WHERE store_id = %s
+          AND date <= %s
+        ORDER BY date
+        """,
+        (store_id, target_date),
+    )
+
+    available_tags = get_special_event_tags(events_df)
+
+    exact_target_events = pd.DataFrame()
+    default_tags = []
+    if not events_df.empty:
+        exact_target_events = events_df[
+            pd.to_datetime(events_df["date"]).dt.date == target_date
+        ].copy()
+        if not exact_target_events.empty:
+            tags = set()
+            for value in exact_target_events["event_tags"].fillna(""):
+                tags.update(split_event_tags(value))
+            default_tags = sorted(tags, key=kana_sort_key)
+
+    selected_event_tags = st.multiselect(
+        "今回のイベント・特定日（分かっている場合）",
+        options=available_tags,
+        default=[x for x in default_tags if x in available_tags],
+        key="deep_event_tags",
+        help="対象日にイベントが登録済みなら自動選択します。未登録なら空欄のままでも分析できます。",
+    )
+
+    diff_rows = int(pd.to_numeric(history["diff_medals"], errors="coerce").notna().sum())
+    pattern_diff_dates = sorted(
+        set(
+            history.loc[
+                history["date"].isin(pattern_dates)
+                & pd.to_numeric(history["diff_medals"], errors="coerce").notna(),
+                "date",
+            ]
+        )
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("今回の暦パターン", pattern_label)
+    c2.metric("過去の同パターン", f"{len(pattern_dates)}回")
+    c3.metric("差枚比較できる回", f"{len(pattern_diff_dates)}回")
+    c4.metric("最新データ", str(latest_data_date.date()))
+
+    if len(pattern_dates) < 3:
+        st.warning(
+            f"{pattern_label}の過去データが{len(pattern_dates)}回しかありません。"
+            "傾向は参考値として見てください。"
+        )
+
+    if diff_rows == 0:
+        st.warning(
+            "この店舗には差枚データがありません。深掘り考察の差枚系ロジックは実行できません。"
+            "BB/RB・ART/ATは台番号別分析やジャグラー設定判別で確認できます。"
+        )
+        st.stop()
+
+    with st.expander("判定条件を調整", expanded=False):
+        c1, c2 = st.columns(2)
+        block_avg_threshold = c1.number_input(
+            "並び強判定：平均差枚/台",
+            min_value=0,
+            max_value=5000,
+            value=500,
+            step=100,
+            key="deep_block_avg",
+        )
+        block_win_threshold = c2.slider(
+            "並び強判定：勝率(%)",
+            min_value=50,
+            max_value=100,
+            value=75 if block_size == 4 else 67,
+            step=1,
+            key="deep_block_win",
+        )
+
+        c3, c4 = st.columns(2)
+        machine_avg_threshold = c3.number_input(
+            "機種強判定：平均差枚/台",
+            min_value=0,
+            max_value=5000,
+            value=500,
+            step=100,
+            key="deep_machine_avg",
+        )
+        machine_win_threshold = c4.slider(
+            "機種強判定：勝率(%)",
+            min_value=50,
+            max_value=100,
+            value=60,
+            step=1,
+            key="deep_machine_win",
+        )
+
+    with st.spinner("1月からの履歴・ローテ・並び・直近データを深掘りしています..."):
+        comparison_df = deep_compare_calendar_pattern(
+            history,
+            target_date,
+            pattern_dates,
+            same_weekday_dates,
+        )
+
+        block_df = deep_block_history(
+            history,
+            current,
+            target_date,
+            pattern_dates,
+            block_size=block_size,
+            avg_threshold=block_avg_threshold,
+            win_threshold=block_win_threshold,
+        )
+
+        pin_df = deep_machine_number_history(
+            history,
+            current,
+            pattern_dates,
+        )
+
+        suffix_df = deep_suffix_history(
+            history,
+            pattern_dates,
+        )
+
+        machine_df = deep_machine_rotation(
+            history,
+            current,
+            target_date,
+            pattern_dates,
+            avg_threshold=machine_avg_threshold,
+            win_threshold=machine_win_threshold,
+        )
+
+        recent_df = deep_recent_features(
+            history,
+            current,
+        )
+
+        deep_cache = prepare_strategy_cache(
+            analysis_data,
+            block_size=block_size,
+        )
+
+        event_df, matched_event_dates = deep_event_machine_history(
+            deep_cache,
+            target_date,
+            events_df,
+            selected_event_tags,
+        )
+
+        final_df = deep_build_final_candidates(
+            current,
+            pin_df,
+            block_df,
+            machine_df,
+            suffix_df,
+            recent_df,
+            event_df,
+        )
+
+    st.markdown("### 1. 特定日・曜日の強さ")
+    st.dataframe(
+        comparison_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if pattern_dates:
+        st.caption(
+            f"{pattern_label}の比較日："
+            + "、".join(pd.Timestamp(x).strftime("%Y/%m/%d") for x in pattern_dates)
+        )
+
+    if not exact_target_events.empty:
+        event_names = exact_target_events["event_name"].astype(str).tolist()
+        st.success("対象日に登録済みイベント：" + "、".join(event_names))
+
+    if selected_event_tags:
+        if matched_event_dates:
+            st.caption(
+                "同イベント過去日："
+                + "、".join(pd.Timestamp(x).strftime("%Y/%m/%d") for x in matched_event_dates)
+            )
+        else:
+            st.info("選択したイベントと一致する過去日がまだありません。")
+
+    st.markdown(f"### 2. {block_size}台並び・場所ローテ")
+    if block_df.empty:
+        st.info("この条件で比較できる並び履歴がありません。")
+    else:
+        show_cols = [
+            "ブロック",
+            "現在機種",
+            "比較回数",
+            "強かった回数",
+            "強かった率(%)",
+            "平均差枚/台",
+            "平均勝率(%)",
+            "直近強日",
+            "今回ローテ",
+            "過去の主な再登場間隔",
+            "今回の間隔",
+            "連続採用率(%)",
+            "1回休み再採用率(%)",
+            "ローテ総合点",
+            "根拠",
+        ]
+        st.dataframe(
+            block_df[show_cols].head(40),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("### 3. 機種ローテ")
+    if machine_df.empty:
+        st.info("機種ローテを計算できる差枚履歴がありません。")
+    else:
+        st.dataframe(
+            machine_df[
+                [
+                    "機種名",
+                    "比較回数",
+                    "強かった回数",
+                    "強かった率(%)",
+                    "平均差枚/台",
+                    "平均勝率(%)",
+                    "直近強日",
+                    "ローテ説明",
+                    "機種ローテ点",
+                ]
+            ].head(30),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    c_left, c_right = st.columns(2)
+
+    with c_left:
+        st.markdown("### 4. 台番号の癖")
+        if pin_df.empty:
+            st.info("台番号傾向を計算できません。")
+        else:
+            st.dataframe(
+                pin_df[
+                    [
+                        "台番号",
+                        "現在機種",
+                        "比較回数",
+                        "平均差枚",
+                        "プラス回数",
+                        "プラス率",
+                        "台番傾向点",
+                    ]
+                ].head(30),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with c_right:
+        st.markdown("### 5. 末尾の癖")
+        if suffix_df.empty:
+            st.info("末尾傾向を計算できません。")
+        else:
+            st.dataframe(
+                suffix_df[
+                    [
+                        "末尾",
+                        "比較回数",
+                        "平均差枚",
+                        "平均勝率",
+                        "末尾傾向点",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.markdown("### 6. 直近の上げ・据え候補")
+    if recent_df.empty:
+        st.info("直近補正を計算できません。")
+    else:
+        st.caption(
+            "差枚が取れていない直近日は無理に0枚扱いせず、差枚なしとして中立にします。"
+        )
+        recent_show = recent_df[
+            [
+                "machine_no",
+                "machine_name",
+                "直近差枚あり日数",
+                "直近差枚",
+                "直近3回差枚",
+                "直近平均G数",
+                "直近タイプ",
+                "直近補正点",
+            ]
+        ].rename(
+            columns={
+                "machine_no": "台番号",
+                "machine_name": "機種名",
+            }
+        )
+        st.dataframe(
+            recent_show.head(40),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("### 7. 最終候補")
+    if final_df.empty:
+        st.info("総合候補を作成できませんでした。")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("候補台数", f"{len(final_df):,}台")
+        c2.metric("Sランク", f"{int((final_df['ランク'] == 'S').sum())}台")
+        c3.metric("Aランク", f"{int((final_df['ランク'] == 'A').sum())}台")
+        c4.metric(
+            "最高点",
+            f"{final_df['深掘り総合点'].max():.1f}点"
+            if final_df["深掘り総合点"].notna().any()
+            else "-",
+        )
+
+        final_cols = [
+            "ランク",
+            "深掘り総合点",
+            "台番号",
+            "機種名",
+            "並び候補",
+            "末尾",
+            "台番傾向点",
+            "並びローテ点",
+            "機種ローテ点",
+            "末尾傾向点",
+            "直近補正点",
+            "イベント点",
+            "主な根拠",
+        ]
+        st.dataframe(
+            final_df[final_cols].head(50),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if not block_df.empty:
+            top_block = block_df.iloc[0]
+            st.info(
+                f"並び最上位は {top_block['ブロック']}。"
+                f"{pattern_label}で {int(top_block['強かった回数'])}/{int(top_block['比較回数'])}回が強判定、"
+                f"現在は「{top_block['今回ローテ']}」です。"
+            )
+
+        if not pin_df.empty:
+            top_pin = pin_df.iloc[0]
+            st.info(
+                f"台番号実績の最上位は {int(top_pin['台番号'])}番。"
+                f"{pattern_label}で平均差枚 {top_pin['平均差枚']:+,.0f}枚、"
+                f"プラス率 {top_pin['プラス率']:.1f}% です。"
+            )
+
+    st.markdown("### 8. 予想スナップショット保存")
+    st.caption(
+        "予想時点の順位と根拠をDBへ保存しておくと、後日実績を入れたあとに"
+        "『予想時点では何を見ていたか』を残せます。"
+    )
+
+    saved_runs = query_df(
+        """
+        SELECT run_id, target_date, pattern_label, latest_data_date, note, created_at
+        FROM slot_deep_prediction_runs
+        WHERE store_id = %s
+        ORDER BY created_at DESC
+        LIMIT 20
+        """,
+        (store_id,),
+    )
+
+    if not saved_runs.empty:
+        st.dataframe(
+            saved_runs.rename(
+                columns={
+                    "run_id": "保存NO",
+                    "target_date": "狙った日",
+                    "pattern_label": "暦パターン",
+                    "latest_data_date": "使用最終データ",
+                    "note": "メモ",
+                    "created_at": "保存日時",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("今回の予想をDBへ保存", expanded=False):
+        if admin_gate():
+            snapshot_note = st.text_input(
+                "保存メモ",
+                value="",
+                placeholder="例：9/19前々日データまで、最終版など",
+                key="deep_snapshot_note",
+            )
+            if st.button(
+                "この深掘り予想を保存",
+                type="primary",
+                key="deep_save_snapshot",
+            ):
+                payload = deep_prediction_payload(
+                    store_name,
+                    target_date,
+                    pattern_label,
+                    latest_data_date.date(),
+                    comparison_df,
+                    block_df,
+                    machine_df,
+                    suffix_df,
+                    final_df,
+                    selected_event_tags,
+                    matched_event_dates,
+                )
+                run_id = save_deep_prediction(
+                    store_id,
+                    target_date,
+                    pattern_label,
+                    latest_data_date.date(),
+                    payload,
+                    snapshot_note,
+                )
+                st.success(f"予想スナップショットを保存しました。保存NO：{run_id}")
                 st.rerun()
 
 
