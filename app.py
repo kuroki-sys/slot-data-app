@@ -17,8 +17,8 @@ from pykakasi import kakasi
 
 
 st.set_page_config(
-    page_title="スロ屋データベース",
-    page_icon="🎰",
+    page_title="SLOT EDGE",
+    page_icon="⚡",
     layout="wide",
 )
 
@@ -4835,7 +4835,8 @@ except Exception as e:
 seed_special_event_defaults()
 seed_juggler_official_defaults()
 
-st.title("🎰 スロ屋データベース")
+st.title("⚡ SLOT EDGE")
+st.caption("DATA-DRIVEN SLOT ANALYTICS  |  分析DB")
 
 menu = st.sidebar.radio(
     "メニュー",
@@ -4846,12 +4847,6 @@ menu = st.sidebar.radio(
         "日別集計",
         "機種別分析",
         "台番号別分析",
-        "明日のジャグラー狙い",
-        "ジャグラー設定判別",
-        "ジャグラー公式スペック管理",
-        "店舗別イベント管理",
-        "深掘り考察",
-        "狙い分析",
     ],
 )
 
@@ -4949,7 +4944,7 @@ elif menu == "初期DB取込":
         "📂 ここにSQLiteファイルをドラッグ＆ドロップ",
         type=["sqlite", "db", "sqlite3"],
         accept_multiple_files=False,
-        help="スロ屋データベースの .sqlite ファイルをこの枠の中へドラッグしてください。",
+        help="分析DBの .sqlite ファイルをこの枠の中へドラッグしてください。",
     )
 
     if uploaded is not None:
