@@ -4847,7 +4847,7 @@ menu = st.sidebar.radio(
         "日別集計",
         "機種別分析",
         "台番号別分析",
-        "🎮 ミニゲーム",
+        "🔮 本日の運勢",
     ],
 )
 
@@ -4931,7 +4931,7 @@ if menu == "ダッシュボード":
             hide_index=True,
         )
 
-elif menu == "🎮 ミニゲーム":
+elif menu == "🔮 本日の運勢":
     from slot_edge_minigame import render_slot_edge_minigame
     render_slot_edge_minigame(query_df)
 
