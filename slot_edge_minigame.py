@@ -1,4 +1,4 @@
-"""SLOT EDGE ミニゲーム（NeonのDBを読み取るだけ）。"""
+"""SLOT EDGE 本日の運勢（NeonのDB登録店舗を読み取るだけ）。"""
 from __future__ import annotations
 
 import json
@@ -59,8 +59,8 @@ def build_html(stores):
 
 
 def render_slot_edge_minigame(query_df):
-    st.subheader("🎮 ミニゲーム｜PUSH PICK")
-    st.caption("行くお店はNeonに台別データを登録済みの店舗だけ表示。登録した最新日の機種から抽選します。")
+    st.subheader("🔮 本日の運勢")
+    st.caption("行くお店はNeonに台別データを登録済みの店舗だけ表示。店名を選んで、本日の運勢をランダム表示します。")
     try:
         df = query_df(SQL)
     except Exception as exc:
@@ -72,5 +72,5 @@ def render_slot_edge_minigame(query_df):
         st.info("対象店舗がありません。『初期DB取込』または『JSON追加』から台別データを登録してください。")
         return
     st.caption(f"DB登録済み店舗：{len(stores)}店。店舗一覧は自動更新されます。")
-    components.html(build_html(stores), height=1210, scrolling=True)
-    st.caption("※ 現在は遊び用のランダム抽選です。店舗別の予測・設定判定・的中率モデルは未接続です。")
+    components.html(build_html(stores), height=980, scrolling=True)
+    st.caption("※ 現在は遊び用のランダム表示です。実際の予測・設定判定・的中率モデルとは連動していません。")
